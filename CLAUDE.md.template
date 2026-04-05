@@ -1,0 +1,115 @@
+# CLAUDE.md — {REPO_NAME}
+
+> This file provides context for AI assistants (Claude, Cursor, etc.) working in this repo.
+> Copy this template when setting up a new repo and fill in every section.
+
+---
+
+## Repo purpose
+
+<!-- What does this repo do? One paragraph max. -->
+
+{REPO_NAME} is...
+
+## How it fits the system
+
+<!-- Where does this repo sit in the tomrivera-ops architecture? -->
+
+- **Upstream dependencies** (this repo depends on):
+- **Downstream consumers** (repos that depend on this):
+- **Role**: {API backend / frontend / shared library / infrastructure / standalone tool}
+
+## Stack
+
+- **Language**:
+- **Framework**:
+- **Database**:
+- **Package manager**:
+- **Runtime**:
+
+## Key directories
+
+```
+/src          — Application source code
+/tests        — Test files
+/config       — Configuration files
+/scripts      — Build and utility scripts
+/docs         — Documentation
+```
+
+## Dev commands
+
+```bash
+# Install dependencies
+{install command}
+
+# Run locally
+{run command}
+
+# Run tests
+{test command}
+
+# Build
+{build command}
+
+# Lint
+{lint command}
+```
+
+## Branch workflow
+
+This repo follows the org-wide branch strategy (see `tomrivera-ops/.github/CONTRIBUTING.md`):
+
+- `main` — Production. No direct commits.
+- `dev` — Integration. PRs only.
+- `feat/*` — Feature work off `dev`.
+- `mobile/*` — Scoped mobile edits off `dev`.
+- `hotfix/*` — Emergency fixes off `main`.
+
+### Repo-specific notes
+
+<!-- Any branch rules unique to this repo? -->
+
+None — follows org standard.
+
+## Safe vs unsafe changes
+
+| Safe (Green zone) | Needs review (Yellow zone) | Do NOT touch (Red zone) |
+|--------------------|---------------------------|------------------------|
+| Add new utility functions | Modify API endpoints | {critical file/module} |
+| Update tests | Change database schemas | {auth/security module} |
+| Fix typos in docs | Edit CI/CD config | {deployment configs} |
+| Add comments | Update dependencies | {secrets or env handling} |
+| Scaffold new components | Modify business logic | |
+
+## Do not touch
+
+<!-- Files or directories AI should never modify without explicit human instruction. -->
+
+- `{path}` — Reason
+- `{path}` — Reason
+
+## Areas requiring caution
+
+<!-- Files that are okay to edit but require extra care and thorough testing. -->
+
+- `{path}` — Why it's sensitive
+- `{path}` — Why it's sensitive
+
+## PR expectations
+
+- Use the org PR template
+- Include validation steps
+- Tag files modified
+- Reference the issue number
+- If AI wrote the code, note it in the PR — the founder reviews all diffs
+
+## Notes for Claude
+
+<!-- Anything else AI should know when working in this repo. -->
+
+- Always read this file at the start of a session
+- Run `git fetch origin && git status` before making changes
+- Check `gh pr list` for open PRs that might conflict
+- When in doubt, ask — don't guess
+- Follow conventional commits: `feat:`, `fix:`, `docs:`, `chore:`, etc.
