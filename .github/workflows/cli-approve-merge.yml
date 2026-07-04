@@ -1,0 +1,70 @@
+name: CLI Approve & Merge
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Target repo (e.g. tomrivera-ops/faraday-validator)"
+        required: true
+      pr_number:
+        description: "PR number to approve and merge"
+        required: true
+      merge_method:
+        description: "merge | squash | rebase"
+        required: false
+        default: squash
+
+jobs:
+  approve-and-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate bot token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.FARADAY_APP_ID }}
+          private-key: ${{ secrets.FARADAY_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Verify PR exists and is open
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          STATE=$(gh pr view ${{ inputs.pr_number }} \
+            --repo ${{ inputs.repo }} \
+            --json state --jq '.state')
+          if [ "$STATE" != "OPEN" ]; then
+            echo "PR #${{ inputs.pr_number }} is not open (state: $STATE). Aborting."
+            exit 1
+          fi
+
+      - name: Approve PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh pr review ${{ inputs.pr_number }} \
+            --approve \
+            --body "Approved via faraday-ci-bot on behalf of repo owner." \
+            --repo ${{ inputs.repo }}
+
+      - name: Merge PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh pr merge ${{ inputs.pr_number }} \
+            --${{ inputs.merge_method }} \
+            --delete-branch \
+            --repo ${{ inputs.repo }}
+
+      - name: Confirm merge
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          STATE=$(gh pr view ${{ inputs.pr_number }} \
+            --repo ${{ inputs.repo }} \
+            --json state --jq '.state')
+          echo "PR #${{ inputs.pr_number }} final state: $STATE"
+          if [ "$STATE" != "MERGED" ]; then
+            echo "Merge failed. Check PR status manually."
+            exit 1
+          fi
