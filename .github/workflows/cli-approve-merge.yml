@@ -3,6 +3,10 @@ name: CLI Approve & Merge
 on:
   workflow_dispatch:
     inputs:
+      owner:
+        description: "Org or user owning the repo (e.g. tomrivera-ops)"
+        required: false
+        default: "tomrivera-ops"
       repo:
         description: "Target repo (e.g. tomrivera-ops/faraday-validator)"
         required: true
@@ -24,7 +28,7 @@ jobs:
         with:
           app-id: ${{ secrets.FARADAY_APP_ID }}
           private-key: ${{ secrets.FARADAY_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
+          owner: ${{ inputs.owner }}
 
       - name: Verify PR exists and is open
         env:
@@ -34,7 +38,7 @@ jobs:
             --repo ${{ inputs.repo }} \
             --json state --jq '.state')
           if [ "$STATE" != "OPEN" ]; then
-            echo "PR #${{ inputs.pr_number }} is not open (state: $STATE). Aborting."
+            echo "PR #${{ inputs.pr_number }} is not OPEN (state: $STATE). Aborting."
             exit 1
           fi
 
@@ -65,6 +69,6 @@ jobs:
             --json state --jq '.state')
           echo "PR #${{ inputs.pr_number }} final state: $STATE"
           if [ "$STATE" != "MERGED" ]; then
-            echo "Merge failed. Check PR status manually."
+            echo "Merge failed — check PR status manually."
             exit 1
           fi
