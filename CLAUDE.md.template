@@ -96,6 +96,12 @@ None — follows org standard.
 - `{path}` — Why it's sensitive
 - `{path}` — Why it's sensitive
 
+## Autonomous execution boundary
+
+If this repo is being modified by an autonomous or governed agent workflow, follow the organization-wide Agent Execution Isolation standard in `tomrivera-ops/.github/ORG_AI_DEVELOPMENT_STANDARD.md`. Do not use a canonical or dirty developer checkout as the worker sandbox. Execute in an approved isolated/disposable workspace, validate the proposed delta against authorized scope, and require governed apply plus independent verification before completion.
+
+Normal interactive pair-programming on a dedicated feature branch follows the branch workflow above.
+
 ## PR expectations
 
 - Use the org PR template
