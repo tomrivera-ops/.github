@@ -145,6 +145,43 @@ Use the `CLAUDE.md.template` in this repo as a starting point.
 
 ---
 
+## Agent Execution Isolation
+
+Authorization for AI to change code does **not** authorize an autonomous worker to mutate a developer's canonical or dirty working tree directly.
+
+For governed or autonomous execution that can mutate repository contents, use this preferred boundary:
+
+```text
+canonical repository
+  -> isolated/disposable workspace
+  -> AI worker
+  -> proposed delta
+  -> scope + policy validation
+  -> governed apply
+  -> independent verification
+  -> evidence
+  -> destroy workspace
+```
+
+### Requirements
+
+- Preserve the canonical checkout and any pre-existing tracked or untracked work.
+- Treat repository metadata (`.git`), symlinks, nested repositories/submodules, partial writes, failures, and timeouts as part of the execution boundary.
+- Prefer prevention by isolation over post-hoc detection and restoration of worker mutations.
+- A worker's successful exit is not independent verification of the resulting change.
+- Apply changes to the canonical target only after validating the proposed delta against the authorized repository, paths, action, and policy scope.
+- Record evidence sufficient to identify the worker run, proposed delta, validation result, applied change, and verification result.
+
+This requirement is aimed at autonomous/governed agent execution. Normal interactive pair-programming on a dedicated feature branch remains permitted under the Action Zones and branch rules above.
+
+### Origin and implementation ownership
+
+This standard was adopted from the Founder PM runtime reconciliation and adversarial review completed 2026-09-29. That work demonstrated that increasingly complex post-hoc dirty-tree restoration still left structural gaps, including repository-metadata mutation. Founder PM remains the canonical technical evidence and implementation workstream; this document owns the reusable organization-wide rule.
+
+Product repositories should consume this pattern rather than independently inventing restoration mechanisms. Machine-enforceable contract fields, if needed, belong in the shared agent-contract layer only after the execution-isolation design is ratified.
+
+---
+
 ## Incident Response: When AI Makes a Mistake
 
 AI will make mistakes. Here's how to handle it:
