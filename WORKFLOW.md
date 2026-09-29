@@ -126,6 +126,14 @@ git push origin dev
 
 ---
 
+## Autonomous Agent Execution
+
+For autonomous or governed workers that can mutate repository contents, follow the organization-wide **Agent Execution Isolation** standard in `ORG_AI_DEVELOPMENT_STANDARD.md`. Do not treat the canonical or dirty developer checkout as the worker sandbox. Prefer an isolated/disposable workspace, validate the resulting delta against authorized scope, apply it through the governed path, verify independently, record evidence, and then discard the execution workspace.
+
+This is distinct from normal interactive feature-branch development described above.
+
+---
+
 ## Safe Resume Rules
 
 ### Resuming in Cursor
