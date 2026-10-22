@@ -1,0 +1,23 @@
+name: Required checks
+
+# Runs on every PR (no path filter). Guards ADR-0013: org prompts and templates must never
+# prescribe a mandatory second-human approval gate.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  required-checks:
+    name: required-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: ADR-0013 approval policy check
+        run: bash scripts/check-approval-policy.sh

@@ -4,6 +4,15 @@
 
 ---
 
+ADR-0013 (solo-founder human approval): the founder is the only required human
+approver, and GitHub never counts a PR author's own approval, so
+`required_approving_review_count` MUST be 0 and code-owner reviews MUST stay off.
+Automated validation replaces the approval. If the repo has an always-run PR
+workflow (no path filter), require it, pinned to GitHub Actions (app id 15368):
+  "required_status_checks": {"strict": true, "checks": [{"context": "required-checks", "app_id": 15368}]}
+Never lower enforce_admins or use a bot approval to get a founder PR merged.
+Policy: https://github.com/tomrivera-ops/agent-contracts/blob/main/decisions/ADR-0013-solo-founder-human-approval.md
+
 You are standardizing the REPO_NAME repository to meet
 tomrivera-ops org governance standards.
 
@@ -48,7 +57,7 @@ STEP 3 — Set up branch protection on main
     "required_status_checks": null,
     "enforce_admins": true,
     "required_pull_request_reviews": {
-      "required_approving_review_count": 1,
+      "required_approving_review_count": 0,
       "dismiss_stale_reviews": true
     },
     "restrictions": null,
@@ -65,7 +74,7 @@ Set up branch protection on dev:
     "required_status_checks": null,
     "enforce_admins": false,
     "required_pull_request_reviews": {
-      "required_approving_review_count": 1,
+      "required_approving_review_count": 0,
       "dismiss_stale_reviews": true
     },
     "restrictions": null,

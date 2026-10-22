@@ -4,6 +4,15 @@
 
 ---
 
+ADR-0013 (solo-founder human approval): the founder is the only required human
+approver, and GitHub never counts a PR author's own approval, so
+`required_approving_review_count` MUST be 0 and code-owner reviews MUST stay off.
+Automated validation replaces the approval. If the repo has an always-run PR
+workflow (no path filter), require it, pinned to GitHub Actions (app id 15368):
+  "required_status_checks": {"strict": true, "checks": [{"context": "required-checks", "app_id": 15368}]}
+Never lower enforce_admins or use a bot approval to get a founder PR merged.
+Policy: https://github.com/tomrivera-ops/agent-contracts/blob/main/decisions/ADR-0013-solo-founder-human-approval.md
+
 You are applying standard tomrivera-ops branch protection
 to REPO_NAME on both main and dev.
 
@@ -19,7 +28,7 @@ STEP 1 — Apply protection to main
     "required_status_checks": null,
     "enforce_admins": true,
     "required_pull_request_reviews": {
-      "required_approving_review_count": 1,
+      "required_approving_review_count": 0,
       "dismiss_stale_reviews": true
     },
     "restrictions": null,
@@ -36,7 +45,7 @@ STEP 2 — Apply protection to dev
     "required_status_checks": null,
     "enforce_admins": false,
     "required_pull_request_reviews": {
-      "required_approving_review_count": 1,
+      "required_approving_review_count": 0,
       "dismiss_stale_reviews": true
     },
     "restrictions": null,
@@ -70,12 +79,12 @@ STEP 5 — Report
 | Check | Expected | Actual | Pass/Fail |
 |-------|----------|--------|-----------|
 | main enforce_admins | true | ? | ? |
-| main required_reviews | 1 | ? | ? |
+| main required_reviews | 0 | ? | ? |
 | main dismiss_stale | true | ? | ? |
 | main force_push | false | ? | ? |
 | main deletions | false | ? | ? |
 | dev enforce_admins | false | ? | ? |
-| dev required_reviews | 1 | ? | ? |
+| dev required_reviews | 0 | ? | ? |
 | dev dismiss_stale | true | ? | ? |
 | dev force_push | false | ? | ? |
 | dev deletions | false | ? | ? |
