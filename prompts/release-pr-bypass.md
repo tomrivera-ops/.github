@@ -1,5 +1,10 @@
 # Release PR Bypass Prompt
 
+> **DEPRECATED 2026-10-22 — do not use.** Superseded by ADR-0013. With
+> `required_approving_review_count: 0`, the founder merges release PRs normally
+> once required checks pass, so lowering `enforce_admins` is never needed.
+> Retained for history only.
+
 > Replace REPO_NAME and PR_NUMBER before pasting into Claude Code.
 
 ---
@@ -22,7 +27,7 @@ STEP 1 — Lower enforce_admins on main
     "required_status_checks": null,
     "enforce_admins": false,
     "required_pull_request_reviews": {
-      "required_approving_review_count": 1,
+      "required_approving_review_count": 0,
       "dismiss_stale_reviews": true
     },
     "restrictions": null,
@@ -54,7 +59,7 @@ STEP 4 — After operator confirms merge, re-lock main
     "required_status_checks": null,
     "enforce_admins": true,
     "required_pull_request_reviews": {
-      "required_approving_review_count": 1,
+      "required_approving_review_count": 0,
       "dismiss_stale_reviews": true
     },
     "restrictions": null,

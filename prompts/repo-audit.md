@@ -4,6 +4,15 @@
 
 ---
 
+ADR-0013 (solo-founder human approval): the founder is the only required human
+approver, and GitHub never counts a PR author's own approval, so
+`required_approving_review_count` MUST be 0 and code-owner reviews MUST stay off.
+Automated validation replaces the approval. If the repo has an always-run PR
+workflow (no path filter), require it, pinned to GitHub Actions (app id 15368):
+  "required_status_checks": {"strict": true, "checks": [{"context": "required-checks", "app_id": 15368}]}
+Never lower enforce_admins or use a bot approval to get a founder PR merged.
+Policy: https://github.com/tomrivera-ops/agent-contracts/blob/main/decisions/ADR-0013-solo-founder-human-approval.md
+
 You are performing a full health check on REPO_NAME
 against tomrivera-ops org standards.
 
@@ -30,7 +39,7 @@ STEP 2 — Branch protection on main
       deletions: .allow_deletions.enabled
     }'
 
-Expected: enforce_admins true, required_reviews 1,
+Expected: enforce_admins true, required_reviews 0,
 dismiss_stale true, force_push false, deletions false.
 
 STEP 3 — Branch protection on dev
@@ -43,7 +52,7 @@ STEP 3 — Branch protection on dev
       deletions: .allow_deletions.enabled
     }'
 
-Expected: enforce_admins false, required_reviews 1,
+Expected: enforce_admins false, required_reviews 0,
 dismiss_stale true, force_push false, deletions false.
 
 STEP 4 — Required files present
@@ -93,10 +102,10 @@ STEP 9 — Final report
 | dev branch exists | yes | ? | ? | Create with: git checkout -b dev && git push origin dev |
 | No stale branches | clean | ? | ? | Delete merged branches |
 | main enforce_admins | true | ? | ? | Run branch-protection-apply prompt |
-| main required_reviews | 1 | ? | ? | Run branch-protection-apply prompt |
+| main required_reviews | 0 | ? | ? | Run branch-protection-apply prompt |
 | main force_push | false | ? | ? | Run branch-protection-apply prompt |
 | dev enforce_admins | false | ? | ? | Run branch-protection-apply prompt |
-| dev required_reviews | 1 | ? | ? | Run branch-protection-apply prompt |
+| dev required_reviews | 0 | ? | ? | Run branch-protection-apply prompt |
 | dev force_push | false | ? | ? | Run branch-protection-apply prompt |
 | README.md present | yes | ? | ? | Run repo-standardize prompt |
 | CLAUDE.md present | yes | ? | ? | Run repo-standardize prompt |
