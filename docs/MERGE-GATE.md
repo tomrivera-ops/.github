@@ -45,3 +45,23 @@ Dispatch the workflow with `mode=founder` and the output as `founder_signature`.
 ## Configuration this workflow needs (separately authorized; not part of this PR)
 - Environment `faraday-merge` in `tomrivera-ops/.github`, with the deployment branch limited to `main`.
 - `FARADAY_APP_ID` and `FARADAY_APP_PRIVATE_KEY` as **environment secrets** of `faraday-merge`. Both jobs run in that environment, so no org-level copy is needed for this workflow.
+
+## Activation kill-switch (default: REFUSE)
+ADR-0012 §1 forbids any bot merge. This workflow therefore ships **inactive** and stays inactive until a
+ratified ADR-0014 supersedes ADR-0012 §1 for the scope it names. A merge needs all three, independently:
+1. Repository variable `FARADAY_BOT_MERGE_ENABLED` is exactly `true`. Otherwise both jobs are skipped and no token is minted.
+2. `policy/merge-policy.json` `activation.enabled` is `true`. This file can only change through a founder-merged PR, because the bot never merges `policy/`. Otherwise every subcommand refuses `bot_merge_not_activated` before any token is minted.
+3. The governing ADR named in `activation.governing_adr` is read live from `main` of its repository and its `## Status` line starts with `Accepted`. Otherwise the gate refuses `governing_adr_not_accepted` or `governing_adr_unreadable`. The shipped path is ADR-0014 (agent-contracts PR #13, Proposed, not on `main`): until it is merged AND ratified the gate refuses (`governing_adr_unreadable`, then `governing_adr_not_accepted`).
+
+Activation never replaces the founder signature. It only permits the gate to evaluate.
+
+## Emergency disable
+Use any one of these. Each is enough on its own:
+- `gh variable delete FARADAY_BOT_MERGE_ENABLED -R tomrivera-ops/.github`, or set it to anything except `true`.
+- `gh workflow disable "CLI Approve & Merge" -R tomrivera-ops/.github`.
+- Revoke the App private key, or suspend or uninstall the `faraday-ci-bot` App installation.
+
+After an emergency disable, also set `activation.enabled` to `false` in a founder-merged PR, and record a `governance-event`.
+
+## Rollback of a bot merge
+The bot never reverts. The founder reverts interactively: run `git revert -m 1 <merge-sha>` for a merge commit, or `git revert <sha>` for squash or rebase. Open a PR and merge it by hand. The merge commit message (`faraday-merge-gate:v1 head=... run=<url>`) and the 90-day decision artifact identify what to revert.

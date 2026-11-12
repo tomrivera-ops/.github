@@ -27,6 +27,12 @@ A merge is allowed only when ALL of these hold for the input head SHA:
     mode refuses (policy_mode_disabled).
 Anything missing, unreadable or ambiguous is REFUSE.
 
+Activation kill-switch (ADR-0012 section 1 forbids bot merges today): every
+subcommand refuses ``bot_merge_not_activated`` unless BOTH the policy flag
+``activation.enabled`` is true AND the repository variable
+FARADAY_BOT_MERGE_ENABLED is exactly "true"; evaluate additionally refuses unless
+the governing ADR named in the policy is read live and its Status is Accepted.
+
 Run only as ``python3 -I scripts/merge_gate.py``. Without isolated mode the script
 directory is sys.path[0] and a repository file such as scripts/json.py would shadow
 the standard library, so the gate refuses before importing anything from sys.path.
@@ -74,6 +80,7 @@ MODES = ("founder",)  # policy mode is disabled; see _require_founder_mode
 METHODS = ("squash", "merge", "rebase")
 OK_CONCLUSIONS = {"success", "skipped"}
 TRUSTED_CHECK_APP = "github-actions"  # user tokens can forge commit statuses, not Actions check runs
+ADR_STATUS_RE = re.compile(r"^##[ \t]+Status[ \t]*\n\s*(\S[^\n]*)", re.M)
 INDEPENDENT_RE = re.compile(r"<!--\s*independent-review:v1\s+(\{.*?\})\s*-->", re.S)
 
 
@@ -142,6 +149,42 @@ def decision_message(owner: str, repo: str, pr: int, sha: str, method: str) -> b
     return f"faraday-merge-decision:v1\n{owner}/{repo}#{pr}\n{sha}\n{method}\n".encode()
 
 
+# ---- activation kill-switch ------------------------------------------------------------
+
+
+def governing_adr(policy: dict) -> dict:
+    """The policy half of the kill-switch: refuse unless activation.enabled is literally true."""
+    act = policy.get("activation")
+    if not isinstance(act, dict) or act.get("enabled") is not True:
+        raise Refuse("bot_merge_not_activated", "policy activation.enabled is not true")
+    adr = act.get("governing_adr")
+    if not isinstance(adr, dict) or adr.get("required_status") != "Accepted" or not all(
+            isinstance(adr.get(k), str) and adr.get(k) for k in ("repository", "path")):
+        raise Refuse("policy_invalid", "activation.governing_adr")
+    return adr
+
+
+def require_activation(policy: dict, variable: str, owner: str) -> dict:
+    """Both halves of the kill-switch; runs for every subcommand, before any token is minted."""
+    adr = governing_adr(policy)
+    if variable != "true":
+        raise Refuse("bot_merge_not_activated", "repository variable FARADAY_BOT_MERGE_ENABLED is not 'true'")
+    adr_owner, _, adr_name = adr["repository"].partition("/")
+    if adr_owner.lower() != owner.lower() or not REPO_RE.fullmatch(adr_name):
+        raise Refuse("governing_adr_unreadable", "governing ADR must live under the target owner")
+    return adr
+
+
+def _check_governing_adr(ev: dict, policy: dict) -> None:
+    governing_adr(policy)
+    text = ev.get("governing_adr")
+    if not isinstance(text, str):
+        raise Refuse("governing_adr_unreadable")
+    m = ADR_STATUS_RE.search(text)
+    if not m or not re.match(r"Accepted\b", m.group(1)):
+        raise Refuse("governing_adr_not_accepted", m.group(1)[:80] if m else "no Status section")
+
+
 # ---- evidence collection (read-only token) -----------------------------------------------
 
 
@@ -168,13 +211,18 @@ def _paged(token: str, url: str, key: str | None = None, cap: int = 2000) -> lis
     raise Refuse("evidence_too_large", url)
 
 
-def collect(token: str, owner: str, repo: str, pr: int, sha: str) -> dict[str, Any]:
+def collect(token: str, owner: str, repo: str, pr: int, sha: str, adr: dict | None = None) -> dict[str, Any]:
     base = f"https://api.github.com/repos/{owner}/{repo}"
     threads_query = {
         "query": """query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
           pullRequest(number:$n){reviewThreads(first:100){totalCount nodes{isResolved isOutdated}}}}}""",
         "variables": {"o": owner, "r": repo, "n": pr}}
+    ev: dict[str, Any] = {}
+    if adr is not None:  # read live from the default branch; never from the PR
+        doc = _api(token, f"https://api.github.com/repos/{adr['repository']}/contents/{adr['path']}?ref=main")
+        ev["governing_adr"] = base64.b64decode(doc["content"]).decode("utf-8")
     return {
+        **ev,
         "repo": _api(token, base),
         "pr": _api(token, f"{base}/pulls/{pr}"),
         "files": _paged(token, f"{base}/pulls/{pr}/files"),
@@ -356,6 +404,7 @@ def verify_founder_signature(signature_b64: str, inp: dict, allowed_signers: Pat
 def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
              allowed_signers: Path | None = None) -> dict[str, Any]:
     _require_founder_mode(inp.get("mode"))  # again here: callers cannot bypass validate_inputs
+    _check_governing_adr(ev, policy)  # kill-switch + ADR Accepted, before any other evidence counts
     _check_pr(ev, inp)
     paths = _changed_paths(ev)
     _check_gate_self(ev, inp, paths, policy)
@@ -383,14 +432,15 @@ def _main(argv: list[str] | None = None) -> int:
         assert_trusted_modules()
         inp = validate_inputs(env.get("IN_OWNER", ""), env.get("IN_REPO", ""), env.get("IN_PR", ""),
                               env.get("IN_SHA", ""), env.get("IN_MODE", ""), env.get("IN_METHOD", ""))
+        policy = json.loads(Path(args.policy).read_text())
+        adr = require_activation(policy, env.get("IN_ACTIVATION", ""), inp["owner"])
         if args.cmd == "validate":
-            print(json.dumps({"valid": True, **inp}))
+            print(json.dumps({"valid": True, **inp, "adr_repo": adr["repository"].partition("/")[2]}))
             return 0
         if args.cmd == "collect":
-            ev = collect(env["GATE_READ_TOKEN"], inp["owner"], inp["repo"], inp["pr"], inp["head_sha"])
+            ev = collect(env["GATE_READ_TOKEN"], inp["owner"], inp["repo"], inp["pr"], inp["head_sha"], adr)
             Path(args.evidence).write_text(json.dumps(ev))
             return 0
-        policy = json.loads(Path(args.policy).read_text())
         ev = json.loads(Path(args.evidence).read_text())
         decision = evaluate(ev, inp, policy, signature_b64=env.get("IN_SIGNATURE", ""))
     except Refuse as r:

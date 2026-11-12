@@ -35,7 +35,11 @@ mg = _load_gate()
 
 SHA = "a" * 40
 OLD = "b" * 40
-POLICY = json.loads((ROOT / "policy" / "merge-policy.json").read_text())
+SHIPPED_POLICY = json.loads((ROOT / "policy" / "merge-policy.json").read_text())
+# The other tests exercise the gate as if a ratified ADR had activated it; KillSwitch tests the shipped file.
+POLICY = copy.deepcopy(SHIPPED_POLICY)
+POLICY["activation"]["enabled"] = True
+ACCEPTED_ADR = "# ADR-0014: risk-tiered merge authority\n\n## Status\nAccepted (2026-12-01)\n\n## Decision\n...\n"
 
 
 def inputs(**kw):
@@ -46,6 +50,7 @@ def inputs(**kw):
 
 def evidence(**over):
     ev = {
+        "governing_adr": ACCEPTED_ADR,
         "repo": {"default_branch": "main", "full_name": "tomrivera-ops/ecosystem-audit"},
         "pr": {"state": "open", "merged": False, "draft": False, "mergeable": True,
                "head": {"sha": SHA, "repo": {"full_name": "tomrivera-ops/ecosystem-audit"}},
@@ -431,7 +436,7 @@ def _isolated_copy():
     (d / "scripts").mkdir()
     (d / "policy").mkdir()
     shutil.copy2(GATE_FILE, d / "scripts" / "merge_gate.py")
-    shutil.copy2(ROOT / "policy" / "merge-policy.json", d / "policy" / "merge-policy.json")
+    (d / "policy" / "merge-policy.json").write_text(json.dumps(POLICY))
     marker = d / "PWNED"
     payload = f"open({str(marker)!r}, 'a').write(__name__ + '\\n')\n"
     for rel in ("scripts/json.py", "scripts/re.py", "scripts/argparse.py", "scripts/subprocess.py",
@@ -442,7 +447,8 @@ def _isolated_copy():
 
 
 GATE_ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "IN_OWNER": "tomrivera-ops", "IN_REPO": "ecosystem-audit",
-            "IN_PR": "7", "IN_SHA": SHA, "IN_MODE": "founder", "IN_METHOD": "squash"}
+            "IN_PR": "7", "IN_SHA": SHA, "IN_MODE": "founder", "IN_METHOD": "squash",
+            "IN_ACTIVATION": "true"}
 
 
 class InterpreterIsolation(unittest.TestCase):
@@ -479,14 +485,14 @@ class InterpreterIsolation(unittest.TestCase):
 
     def test_workflow_inline_python_ignores_planted_modules(self):
         d, marker = _isolated_copy()
-        (d / "validated.json").write_text(json.dumps({"repo": "ecosystem-audit"}))
+        (d / "validated.json").write_text(json.dumps({"repo": "ecosystem-audit", "adr_repo": "agent-contracts"}))
         for line in _workflow_python_lines():
             if " -c " not in line:
                 continue
             cmd = line.strip().split(" >> ", 1)[0]
             done = subprocess.run(["bash", "-c", cmd], cwd=d, env=GATE_ENV, capture_output=True, text=True, timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
-            self.assertEqual(done.stdout.strip(), "repo_name=ecosystem-audit")
+            self.assertEqual(done.stdout.strip(), "repo_name=ecosystem-audit\nadr_repo=agent-contracts")
         self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
 
     def test_module_loaded_from_repository_refuses(self):
@@ -649,6 +655,86 @@ class PolicyModeDisabled(unittest.TestCase):
         self.assertNotIn("policy", mode_block)
         self.assertNotIn("faraday-review", wf)
         self.assertNotIn("A0", wf)
+
+
+class KillSwitch(unittest.TestCase):
+    """P5 corrective: ADR-0012 section 1 forbids bot merges until a ratified ADR-0014 says otherwise.
+    The shipped policy and an unset repository variable must each refuse on their own."""
+
+    def refuse(self, code, fn):
+        with self.assertRaises(mg.Refuse) as caught:
+            fn()
+        self.assertEqual(caught.exception.code, code)
+
+    def test_shipped_policy_is_disabled(self):
+        self.assertIs(SHIPPED_POLICY["activation"]["enabled"], False)
+        self.assertEqual(SHIPPED_POLICY["activation"]["governing_adr"]["required_status"], "Accepted")
+
+    def test_shipped_policy_refuses_even_with_complete_evidence_and_a_founder_signature(self):
+        inp = inputs()
+        self.refuse("bot_merge_not_activated", lambda: mg.evaluate(
+            evidence(), inp, SHIPPED_POLICY, signature_b64=good_sig(inp), allowed_signers=KEYS.allowed))
+        self.refuse("bot_merge_not_activated", lambda: mg.require_activation(SHIPPED_POLICY, "true", "tomrivera-ops"))
+
+    def test_policy_flag_must_be_literally_true(self):
+        for value in ("true", 1, "yes", None):
+            policy = copy.deepcopy(POLICY)
+            policy["activation"]["enabled"] = value
+            self.refuse("bot_merge_not_activated", lambda: mg.require_activation(policy, "true", "tomrivera-ops"))
+        policy = copy.deepcopy(POLICY)
+        del policy["activation"]
+        self.refuse("bot_merge_not_activated", lambda: mg.require_activation(policy, "true", "tomrivera-ops"))
+
+    def test_repository_variable_must_be_exactly_true(self):
+        for var in ("", "True", "1", "yes", " true", "true\n"):
+            self.refuse("bot_merge_not_activated", lambda: mg.require_activation(POLICY, var, "tomrivera-ops"))
+        self.assertEqual(mg.require_activation(POLICY, "true", "TOMRIVERA-OPS")["repository"],
+                         "tomrivera-ops/agent-contracts")
+
+    def test_governing_adr_must_be_accepted(self):
+        inp = inputs()
+        for text in (ACCEPTED_ADR.replace("Accepted", "Proposed"), "## Status\nNot Accepted\n",
+                     ACCEPTED_ADR.replace("## Status", "## Context"), "## Status\nAcceptedish\n"):
+            ev = evidence(governing_adr=text)
+            self.refuse("governing_adr_not_accepted", lambda: run(ev, inp))
+        ev = evidence()
+        del ev["governing_adr"]
+        self.refuse("governing_adr_unreadable", lambda: run(ev, inp))
+
+    def test_governing_adr_policy_cannot_relax_the_status(self):
+        policy = copy.deepcopy(POLICY)
+        policy["activation"]["governing_adr"]["required_status"] = "Proposed"
+        self.refuse("policy_invalid", lambda: mg.require_activation(policy, "true", "tomrivera-ops"))
+
+    def test_entry_point_refuses_before_any_token_when_not_activated(self):
+        d, marker = _isolated_copy()
+        (d / "policy" / "merge-policy.json").write_text(json.dumps(SHIPPED_POLICY))
+        (d / "evidence.json").write_text(json.dumps(evidence()))
+        for cmd, env in (("validate", GATE_ENV), ("collect", dict(GATE_ENV, GATE_READ_TOKEN="x")),
+                         ("evaluate", GATE_ENV)):
+            done = subprocess.run([sys.executable, "-I", "scripts/merge_gate.py", cmd], cwd=d, env=env,
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(done.returncode, 3, (cmd, done.stdout, done.stderr))
+            self.assertEqual(json.loads(done.stdout)["code"], "bot_merge_not_activated", cmd)
+        (d / "policy" / "merge-policy.json").write_text(json.dumps(POLICY))
+        done = subprocess.run([sys.executable, "-I", "scripts/merge_gate.py", "validate"], cwd=d,
+                              env=dict(GATE_ENV, IN_ACTIVATION=""), capture_output=True, text=True, timeout=60)
+        self.assertEqual(json.loads(done.stdout)["code"], "bot_merge_not_activated")
+        self.assertFalse((d / "decision.json").exists())
+        self.assertFalse(marker.exists())
+
+    def test_workflow_jobs_are_skipped_unless_the_variable_is_set(self):
+        wf = WorkflowStatic.wf
+        gate = wf.split("\n  gate:\n", 1)[1].split("\n  merge:\n", 1)[0]
+        merge = wf.split("\n  merge:\n", 1)[1]
+        self.assertIn("vars.FARADAY_BOT_MERGE_ENABLED == 'true' &&", gate.split("runs-on", 1)[0])
+        self.assertIn("if: vars.FARADAY_BOT_MERGE_ENABLED == 'true'", merge.split("runs-on", 1)[0])
+        self.assertIn("IN_ACTIVATION: ${{ vars.FARADAY_BOT_MERGE_ENABLED }}", gate)
+
+    def test_merge_rechecks_head_and_base_before_merging(self):
+        merge = WorkflowStatic.wf.split("\n  merge:\n", 1)[1]
+        self.assertLess(merge.index('[ "${now_sha}" != "${IN_SHA}" ]'), merge.index("-X PUT"))
+        self.assertIn('[ "${now_base}" != "${default_branch}" ]', merge)
 
 
 if __name__ == "__main__":

@@ -4,5 +4,14 @@
   "gate_paths": [".github/*", "scripts/*", "policy/*", "*.py", "*.pyc", "*.pth", ".gitattributes", ".gitmodules", "CODEOWNERS", "docs/MERGE-GATE.md", "validated.json", "evidence.json", "decision.json"],
   "gate_repository_mergeable_paths": ["*.md", "*.template"],
   "allowed_signers": "policy/founder-allowed-signers",
-  "required_contexts": {}
+  "required_contexts": {},
+  "activation": {
+    "enabled": false,
+    "repository_variable": "FARADAY_BOT_MERGE_ENABLED",
+    "governing_adr": {
+      "repository": "tomrivera-ops/agent-contracts",
+      "path": "decisions/ADR-0014-risk-tiered-delegated-merge.md",
+      "required_status": "Accepted"
+    }
+  }
 }
