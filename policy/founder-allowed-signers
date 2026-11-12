@@ -1,0 +1,3 @@
+# faraday-ci-bot merge gate: founder decision key (same founder key as linode-ops founder-allowed-signers,
+# SHA256:yhaDzjdnB4aFL11XaMxhjHuTYdLwlQXw6L+rS6BILDE), limited to its own namespace.
+founder namespaces="faraday-merge-go" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFXdr+chhIqU0pQlrLi1qHZZSdRXNiSYqIIv8PXVdWKq

@@ -1,0 +1,8 @@
+{
+  "policy_version": "2",
+  "gate_repository": "tomrivera-ops/.github",
+  "gate_paths": [".github/*", "scripts/*", "policy/*", "*.py", "*.pyc", "*.pth", ".gitattributes", ".gitmodules", "CODEOWNERS", "docs/MERGE-GATE.md", "validated.json", "evidence.json", "decision.json"],
+  "gate_repository_mergeable_paths": ["*.md", "*.template"],
+  "allowed_signers": "policy/founder-allowed-signers",
+  "required_contexts": {}
+}

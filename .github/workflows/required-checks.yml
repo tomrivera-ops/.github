@@ -21,3 +21,5 @@ jobs:
           persist-credentials: false
       - name: ADR-0013 approval policy check
         run: bash scripts/check-approval-policy.sh
+      - name: Merge gate tests (FARADAY-CI-BOT-HARDENING-001)
+        run: python3 -I scripts/test_merge_gate.py -v
