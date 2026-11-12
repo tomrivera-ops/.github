@@ -12,7 +12,9 @@ Subcommands
 A merge is allowed only when ALL of these hold for the input head SHA:
   * PR open, not draft, same-repo head (no forks), base == default branch,
     head.sha == input head_sha;
-  * the PR does not touch the merge gate itself (never self-merge the gate);
+  * the PR does not touch the merge gate itself (never self-merge the gate); in the
+    gate repository only allowlisted documentation may change, so nothing that can
+    execute, configure or decide the gate can be merged by the bot;
   * every check run at the head is completed with success/skipped, at least one
     exists, every commit status is success, and policy-required contexts pass;
   * Codex: a chatgpt-codex-connector receipt names this head as clean, Codex
@@ -25,8 +27,27 @@ A merge is allowed only when ALL of these hold for the input head SHA:
                        merge_authorized=true for an A0/A1 (green) class, and
                        no protected path is touched.
 Anything missing, unreadable or ambiguous is REFUSE.
+
+Run only as ``python3 -I scripts/merge_gate.py``. Without isolated mode the script
+directory is sys.path[0] and a repository file such as scripts/json.py would shadow
+the standard library, so the gate refuses before importing anything from sys.path.
 """
 from __future__ import annotations
+
+import sys
+
+
+def _require_isolated_interpreter() -> None:
+    flags = sys.flags
+    if not (flags.isolated and flags.ignore_environment and flags.no_user_site
+            and getattr(flags, "safe_path", False)):
+        sys.stdout.write('{"decision": "REFUSE", "code": "interpreter_not_isolated", '
+                         '"detail": "run python3 -I"}\n')
+        raise SystemExit(4)
+
+
+if __name__ == "__main__":
+    _require_isolated_interpreter()  # before any import that searches sys.path
 
 import argparse
 import base64
@@ -58,6 +79,9 @@ INDEPENDENT_RE = re.compile(r"<!--\s*independent-review:v1\s+(\{.*?\})\s*-->", r
 FR_AUTH_RE = re.compile(r"faraday-merge-authorization:v1\s+(\{.*?\})", re.S)
 
 
+GATE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
 class Refuse(Exception):
     """A deterministic refusal with a stable reason code."""
 
@@ -65,6 +89,23 @@ class Refuse(Exception):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.detail = detail
+
+
+def _inside_gate_root(path: str) -> bool:
+    real = os.path.realpath(path)
+    return real == GATE_ROOT or real.startswith(GATE_ROOT + os.sep)
+
+
+def assert_trusted_modules() -> None:
+    """Refuse if any repository directory is importable or any module came from the repository."""
+    for entry in sys.path:
+        if entry in ("", ".") or _inside_gate_root(entry):
+            raise Refuse("untrusted_import_path", entry or "<cwd>")
+    own = os.path.realpath(__file__)
+    for name, module in list(sys.modules.items()):
+        origin = getattr(module, "__file__", None)
+        if isinstance(origin, str) and os.path.realpath(origin) != own and _inside_gate_root(origin):
+            raise Refuse("untrusted_module_loaded", name)
 
 
 # ---- inputs -------------------------------------------------------------------------
@@ -174,7 +215,16 @@ def _changed_paths(ev: dict) -> list[str]:
 
 
 def _match(path: str, patterns: list[str]) -> bool:
-    return any(fnmatch.fnmatchcase(path, p) for p in patterns)
+    """Case-insensitive glob match (``*`` also crosses ``/``); stricter than case-sensitive."""
+    low = path.lower()
+    return any(fnmatch.fnmatchcase(low, p.lower()) for p in patterns)
+
+
+def _patterns(policy: dict, key: str) -> list[str]:
+    value = policy.get(key)
+    if not isinstance(value, list) or not value or not all(isinstance(p, str) and p for p in value):
+        raise Refuse("policy_invalid", key)
+    return value
 
 
 def _canonical_repo(ev: dict, inp: dict) -> str:
@@ -190,9 +240,20 @@ def _canonical_repo(ev: dict, inp: dict) -> str:
 
 
 def _check_gate_self(ev: dict, inp: dict, paths: list[str], policy: dict) -> None:
-    target = _canonical_repo(ev, inp)
-    if target == policy["gate_repository"].lower() and any(_match(p, policy["gate_paths"]) for p in paths):
-        raise Refuse("gate_self_modification", "the gate never merges changes to itself")
+    gate_repo = policy.get("gate_repository")
+    if not isinstance(gate_repo, str) or "/" not in gate_repo:
+        raise Refuse("policy_invalid", "gate_repository")
+    gate_paths = _patterns(policy, "gate_paths")
+    mergeable = _patterns(policy, "gate_repository_mergeable_paths")
+    if _canonical_repo(ev, inp) != gate_repo.lower():
+        return
+    hits = [p for p in paths if _match(p, gate_paths)]
+    if hits:
+        raise Refuse("gate_self_modification", f"the gate never merges changes to itself: {hits[0]}")
+    # Deny by default: in the gate repository the bot merges allowlisted documentation only.
+    others = [p for p in paths if not _match(p, mergeable)]
+    if others:
+        raise Refuse("gate_repository_path_not_allowlisted", others[0])
 
 
 def _check_ci(ev: dict, inp: dict, policy: dict) -> None:
@@ -337,6 +398,7 @@ def _main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
     env = os.environ
     try:
+        assert_trusted_modules()
         inp = validate_inputs(env.get("IN_OWNER", ""), env.get("IN_REPO", ""), env.get("IN_PR", ""),
                               env.get("IN_SHA", ""), env.get("IN_MODE", ""), env.get("IN_METHOD", ""))
         if args.cmd == "validate":

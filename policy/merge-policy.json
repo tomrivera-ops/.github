@@ -1,7 +1,9 @@
 {
   "policy_version": "1",
   "gate_repository": "tomrivera-ops/.github",
-  "gate_paths": [".github/workflows/cli-approve-merge.yml", "scripts/merge_gate.py", "scripts/test_merge_gate.py", "policy/*"],
+  "gate_paths": [".github/*", "scripts/*", "policy/*", "*.py", "*.pyc", "*.pth", ".gitattributes", ".gitmodules",
+                 "CODEOWNERS", "docs/MERGE-GATE.md", "validated.json", "evidence.json", "decision.json"],
+  "gate_repository_mergeable_paths": ["*.md", "*.template"],
   "allowed_signers": "policy/founder-allowed-signers",
   "faraday_review_check": "faraday-review / governed-summary",
   "protected_paths": [".github/*", ".github/**", "*/.github/*", "CODEOWNERS", "*/CODEOWNERS", "schemas/*", "**/schemas/*",

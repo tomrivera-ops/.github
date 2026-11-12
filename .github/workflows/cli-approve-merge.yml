@@ -13,7 +13,9 @@
 #     token scoped to the one repository, only after the gate ALLOWs, and merges with
 #     sha=<head> so GitHub rejects the merge if the head moved;
 #   * no approval is submitted (ADR-0012), no --admin, no PR code is checked out,
-#     and inputs reach scripts only through environment variables.
+#     and inputs reach scripts only through environment variables;
+#   * every Python step runs isolated (python3 -I), so repository files can never
+#     shadow the standard library; the gate refuses to run without it.
 name: CLI Approve & Merge
 
 on:
@@ -87,8 +89,8 @@ jobs:
       - name: Validate inputs (before any token exists)
         id: validate
         run: |
-          python3 scripts/merge_gate.py validate > validated.json
-          python3 -c "import json;print('repo_name='+json.load(open('validated.json'))['repo'])" >> "$GITHUB_OUTPUT"
+          python3 -I scripts/merge_gate.py validate > validated.json
+          python3 -I -c "import json;print('repo_name='+json.load(open('validated.json'))['repo'])" >> "$GITHUB_OUTPUT"
 
       - name: Mint read-only token for the target repository
         id: read-token
@@ -107,13 +109,13 @@ jobs:
       - name: Collect evidence
         env:
           GATE_READ_TOKEN: ${{ steps.read-token.outputs.token }}
-        run: python3 scripts/merge_gate.py collect --evidence evidence.json
+        run: python3 -I scripts/merge_gate.py collect --evidence evidence.json
 
       - name: Evaluate merge gate
         env:
           IN_SIGNATURE: ${{ inputs.founder_signature }}
         run: |
-          python3 scripts/merge_gate.py evaluate --evidence evidence.json --decision decision.json
+          python3 -I scripts/merge_gate.py evaluate --evidence evidence.json --decision decision.json
           {
             echo "### faraday-ci-bot merge gate: ALLOW"
             echo '```json'

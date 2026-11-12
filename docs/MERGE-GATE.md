@@ -5,7 +5,13 @@
 
 ## The gate refuses unless all of these hold at the exact head
 1. The PR is open, not a draft, comes from a same-repo branch (no fork), its base is the default branch, and its head equals the `head_sha` input.
-2. The PR does not touch the gate itself: the workflow, the scripts and `policy/` in `tomrivera-ops/.github`.
+2. **The gate never merges changes to itself.** In `tomrivera-ops/.github`, the following always refuse, whatever the authorization (`gate_self_modification`):
+   - anything under `.github/`, `scripts/` or `policy/`;
+   - any `*.py`, `*.pyc` or `*.pth` file anywhere;
+   - `.gitattributes`, `.gitmodules`, `CODEOWNERS` and this document;
+   - the gate's workspace files (`validated.json`, `evidence.json`, `decision.json`).
+
+   Every other path refuses too, unless it matches the documentation allowlist `gate_repository_mergeable_paths` (`*.md`, `*.template`); that refusal is `gate_repository_path_not_allowlisted`. Matching is case-insensitive, and renames count both their old and new paths.
 3. **CI.** At least one check run exists; every check run at the head completed with `success` or `skipped`; every commit status is `success`; and each policy-required context is satisfied by a **GitHub Actions** check run. A commit status cannot satisfy a required context, because any user token can forge one.
 4. **Codex.**
    - A `chatgpt-codex-connector[bot]` receipt names this head ("Didn't find any major issues", with "Reviewed commit" matching at least the first 10 hex characters).
@@ -17,6 +23,9 @@
 6. **Authorization:**
    - `mode=founder`: an SSH signature by the founder key, `SHA256:yhaDzjdnB4aFL11XaMxhjHuTYdLwlQXw6L+rS6BILDE`, namespace `faraday-merge-go`, over the exact decision message. That key is not on the agent host, so agents cannot produce this signature.
    - `mode=policy`: a GitHub Actions check run `faraday-review / governed-summary` at the head that reports `merge_authorized: true`, `risk_class: green` and `approval_class: A0|A1`, and no protected path is touched. Faraday Review Phase 1 never authorizes, so **policy mode refuses today by design**.
+
+## Trusted execution
+Every Python step runs as `python3 -I`, so neither the script directory, the working directory nor `PYTHON*` variables reach `sys.path`. Without isolated mode, `merge_gate.py` refuses (`interpreter_not_isolated`) before it imports anything that searches `sys.path`. Before it decides, it also refuses if any repository directory is importable (`untrusted_import_path`) or any loaded module came from the repository (`untrusted_module_loaded`). A planted `scripts/json.py` therefore never executes, and it cannot be merged by the bot in the first place.
 
 ## Founder decision (founder mode)
 On the founder's own device, which holds the founder key:
