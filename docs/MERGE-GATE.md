@@ -33,4 +33,4 @@ Dispatch the workflow with `mode=founder` and the output as `founder_signature`.
 
 ## Configuration this workflow needs (separately authorized; not part of this PR)
 - Environment `faraday-merge` in `tomrivera-ops/.github`, with the deployment branch limited to `main`.
-- `FARADAY_APP_ID` and `FARADAY_APP_PRIVATE_KEY` available to this repository. Recommended rollout: environment secrets, plus org secret visibility narrowed.
+- `FARADAY_APP_ID` and `FARADAY_APP_PRIVATE_KEY` as **environment secrets** of `faraday-merge`. Both jobs run in that environment, so no org-level copy is needed for this workflow.

@@ -65,6 +65,9 @@ jobs:
       github.triggering_actor == 'tomrivera-PSE'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # Same environment as the merge job, so the App key can live only in
+    # environment secrets (deployment branch: main) and nowhere org-wide.
+    environment: faraday-merge
     permissions:
       contents: read
     outputs:

@@ -319,6 +319,8 @@ class WorkflowStatic(unittest.TestCase):
         self.assertIn("needs: gate", merge)
         self.assertIn("environment: faraday-merge", merge)
         self.assertIn('-f sha="${IN_SHA}"', merge)
+        gate = self.wf.split("\n  gate:\n", 1)[1].split("\n  merge:\n", 1)[0]
+        self.assertIn("environment: faraday-merge", gate)
 
     def test_no_approval_no_admin_no_pr_checkout(self):
         self.assertNotIn("--approve", self.wf)
