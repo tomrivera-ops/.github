@@ -23,6 +23,7 @@ GATE_FILE = ROOT / "scripts" / "merge_gate.py"
 
 def _load_gate():
     """Load the gate from its absolute path; never put a repository directory on sys.path."""
+    sys.dont_write_bytecode = True  # never leave a __pycache__ in the repository
     spec = importlib.util.spec_from_file_location("merge_gate", GATE_FILE)
     module = importlib.util.module_from_spec(spec)
     sys.modules["merge_gate"] = module
