@@ -108,15 +108,6 @@ class Allow(unittest.TestCase):
         self.assertEqual(out["decision"], "ALLOW")
         self.assertEqual(out["authority"]["type"], "founder_signature")
 
-    def test_policy_mode_allows_faraday_review_a1_authorization(self):
-        inp = inputs(mode="policy")
-        auth = {"head_sha": SHA, "merge_authorized": True, "risk_class": "green", "approval_class": "A1"}
-        ev = evidence()
-        ev["check_runs"].append({"name": POLICY["faraday_review_check"], "head_sha": SHA, "status": "completed",
-                                 "conclusion": "success", "app": {"slug": "github-actions"},
-                                 "output": {"text": "faraday-merge-authorization:v1 " + json.dumps(auth)}})
-        self.assertEqual(mg.evaluate(ev, inp, POLICY)["decision"], "ALLOW")
-
 
 class Refusals(unittest.TestCase):
     def refuse(self, code, ev=None, inp=None, sig=None):
@@ -236,38 +227,7 @@ class Refusals(unittest.TestCase):
     def test_garbage_signature(self):
         self.refuse("founder_signature_malformed", sig=base64.b64encode(b"not a signature").decode())
 
-    def test_policy_mode_without_authorization(self):
-        inp = inputs(mode="policy")
-        with self.assertRaises(mg.Refuse) as caught:
-            mg.evaluate(evidence(), inp, POLICY)
-        self.assertEqual(caught.exception.code, "policy_authorization_missing")
-
-    def test_policy_authorization_from_untrusted_app_or_other_head(self):
-        inp = inputs(mode="policy")
-        for app, head, cls in (("evil-app", SHA, "A1"), ("github-actions", OLD, "A1"), ("github-actions", SHA, "A2")):
-            auth = {"head_sha": head, "merge_authorized": True, "risk_class": "green", "approval_class": cls}
-            ev = evidence()
-            ev["check_runs"].append({"name": POLICY["faraday_review_check"], "head_sha": SHA, "status": "completed",
-                                     "conclusion": "success", "app": {"slug": app},
-                                     "output": {"text": "faraday-merge-authorization:v1 " + json.dumps(auth)}})
-            with self.assertRaises(mg.Refuse) as caught:
-                mg.evaluate(ev, inp, POLICY)
-            self.assertEqual(caught.exception.code, "policy_authorization_missing", (app, head, cls))
-
     # protected paths / privilege escalation
-    def test_protected_path_in_policy_mode(self):
-        inp = inputs(mode="policy")
-        with self.assertRaises(mg.Refuse) as caught:
-            mg.evaluate(evidence(files=[{"filename": ".github/workflows/ci.yml"}]), inp, POLICY)
-        self.assertEqual(caught.exception.code, "protected_path_requires_founder")
-
-    def test_renamed_from_protected_path_in_policy_mode(self):
-        inp = inputs(mode="policy")
-        ev = evidence(files=[{"filename": "docs/x.yml", "previous_filename": ".github/workflows/ci.yml"}])
-        with self.assertRaises(mg.Refuse) as caught:
-            mg.evaluate(ev, inp, POLICY)
-        self.assertEqual(caught.exception.code, "protected_path_requires_founder")
-
     def test_gate_never_merges_changes_to_itself_even_with_founder_signature(self):
         inp = inputs(repo=".github")
         ev = evidence(files=[{"filename": "scripts/merge_gate.py"}])
@@ -378,8 +338,8 @@ PR12_FILES = [".github/workflows/cli-approve-merge.yml", ".github/workflows/requ
               "scripts/merge_gate.py", "scripts/test_merge_gate.py"]
 
 
-def gate_repo_case(files, mode="founder"):
-    inp = inputs(repo=".github", mode=mode)
+def gate_repo_case(files):
+    inp = inputs(repo=".github")
     ev = evidence(files=files)
     ev["repo"]["full_name"] = GATE_REPO
     for side in ("head", "base"):
@@ -393,9 +353,9 @@ class GateRepositoryIntegrity(unittest.TestCase):
     may only merge allowlisted documentation; anything that can execute, configure or decide
     the gate refuses, even with a valid founder signature."""
 
-    def refuse_in_gate_repo(self, files, codes, mode="founder"):
-        ev, inp = gate_repo_case(files, mode)
-        sig = good_sig(inp) if mode == "founder" else ""
+    def refuse_in_gate_repo(self, files, codes):
+        ev, inp = gate_repo_case(files)
+        sig = good_sig(inp)
         with self.assertRaises(mg.Refuse, msg=files) as caught:
             mg.evaluate(ev, inp, POLICY, signature_b64=sig, allowed_signers=KEYS.allowed)
         self.assertIn(caught.exception.code, codes, files)
@@ -404,10 +364,8 @@ class GateRepositoryIntegrity(unittest.TestCase):
         for path in ("scripts/json.py", "scripts/re.py", "scripts/subprocess.py", "json.py",
                      "sitecustomize.py", "usercustomize.py", "lib/evil.pth", "scripts/__pycache__/json.cpython-312.pyc",
                      "Scripts/json.py", "SCRIPTS/JSON.PY", "docs/json.py"):
-            for mode in ("founder", "policy"):
-                self.refuse_in_gate_repo([{"filename": "README.md"}, {"filename": path}],
-                                         {"gate_self_modification", "gate_repository_path_not_allowlisted",
-                                          "protected_path_requires_founder"}, mode)
+            self.refuse_in_gate_repo([{"filename": "README.md"}, {"filename": path}],
+                                     {"gate_self_modification", "gate_repository_path_not_allowlisted"})
 
     def test_script_substitution_cannot_be_merged(self):
         for path in ("scripts/merge_gate.py", "scripts/test_merge_gate.py", "scripts/check-approval-policy.sh",
@@ -596,6 +554,101 @@ class WorkflowPythonIsolation(unittest.TestCase):
             self.assertEqual((method, url), ("POST", "https://api.github.com/graphql"))
             self.assertTrue(body["query"].lstrip().startswith("query("), body["query"])
             self.assertNotIn("mutation", body["query"])
+
+
+FORGED_FR_CHECK = "faraday-review / governed-summary"
+
+
+def forged_authorization_evidence(**over):
+    """A successful Faraday Review check run that any workflow GITHUB_TOKEN could create."""
+    ev = evidence(**over)
+    auth = {"head_sha": SHA, "merge_authorized": True, "risk_class": "green", "approval_class": "A0"}
+    ev["check_runs"].append({"name": FORGED_FR_CHECK, "head_sha": SHA, "status": "completed",
+                             "conclusion": "success", "app": {"slug": "github-actions", "id": 15368},
+                             "output": {"title": "A0 merge authorized",
+                                        "text": "faraday-merge-authorization:v1 " + json.dumps(auth)}})
+    return ev
+
+
+class PolicyModeDisabled(unittest.TestCase):
+    """Independent review at c6a4043 (High): policy-mode authorization could be forged with a
+    check run. Policy mode is removed; only a founder signature authorizes a merge."""
+
+    def test_policy_mode_refused_at_validation_before_any_token(self):
+        with self.assertRaises(mg.Refuse) as caught:
+            inputs(mode="policy")
+        self.assertEqual(caught.exception.code, "policy_mode_disabled")
+
+    def test_every_non_founder_mode_spelling_refuses(self):
+        for mode in ("Policy", "POLICY", " policy", "policy ", "policy\n", "policy\x00", "a0", "A1", "auto",
+                     "faraday-review", "founder,policy", "founder policy", "Founder", "", "admin"):
+            with self.assertRaises(mg.Refuse, msg=repr(mode)) as caught:
+                inputs(mode=mode)
+            self.assertIn(caught.exception.code, {"policy_mode_disabled", "invalid_mode"}, repr(mode))
+
+    def test_forged_faraday_review_check_cannot_authorize_even_if_validation_is_bypassed(self):
+        inp = dict(inputs(), mode="policy")
+        for sig in ("", None):
+            with self.assertRaises(mg.Refuse) as caught:
+                if sig is None:
+                    run(forged_authorization_evidence(), inp)  # even with a valid founder signature
+                else:
+                    mg.evaluate(forged_authorization_evidence(), inp, POLICY)
+            self.assertEqual(caught.exception.code, "policy_mode_disabled")
+
+    def test_forged_check_does_not_replace_the_founder_signature(self):
+        with self.assertRaises(mg.Refuse) as caught:
+            mg.evaluate(forged_authorization_evidence(), inputs(), POLICY, signature_b64="",
+                        allowed_signers=KEYS.allowed)
+        self.assertEqual(caught.exception.code, "founder_signature_missing")
+        with self.assertRaises(mg.Refuse) as caught:
+            run(forged_authorization_evidence(), inputs(), sig=good_sig(inputs(), keys=OTHER))
+        self.assertEqual(caught.exception.code, "founder_signature_invalid")
+
+    def test_founder_allow_records_only_founder_authority(self):
+        out = run(forged_authorization_evidence(), inputs())
+        self.assertEqual(out["authority"], {"type": "founder_signature", "namespace": mg.SIGNATURE_NAMESPACE})
+        self.assertEqual(out["mode"], "founder")
+
+    def test_unexpected_policy_configuration_cannot_reenable_policy_mode(self):
+        policy = copy.deepcopy(POLICY)
+        policy.update({"faraday_review_check": FORGED_FR_CHECK, "policy_mode": True, "policy_mode_enabled": True,
+                       "modes": ["founder", "policy"], "allowed_modes": ["policy"], "protected_paths": []})
+        inp = dict(inputs(), mode="policy")
+        with self.assertRaises(mg.Refuse) as caught:
+            mg.evaluate(forged_authorization_evidence(), inp, policy)
+        self.assertEqual(caught.exception.code, "policy_mode_disabled")
+        for key in ("faraday_review_check", "protected_paths"):
+            self.assertNotIn(key, POLICY)
+
+    def test_no_policy_authorization_code_path_remains(self):
+        self.assertEqual(mg.MODES, ("founder",))
+        self.assertFalse(hasattr(mg, "_check_policy_authorization"))
+        self.assertFalse(hasattr(mg, "FR_AUTH_RE"))
+        src = GATE_FILE.read_text()
+        for gone in ("faraday-merge-authorization", "merge_authorized", "approval_class", "faraday_review"):
+            self.assertNotIn(gone, src, gone)
+
+    def test_entry_point_refuses_policy_mode_for_every_subcommand(self):
+        d, marker = _isolated_copy()
+        (d / "evidence.json").write_text(json.dumps(forged_authorization_evidence()))
+        for cmd in ("validate", "collect", "evaluate"):
+            env = dict(GATE_ENV, IN_MODE="policy", GATE_READ_TOKEN="x")
+            done = subprocess.run([sys.executable, "-I", "scripts/merge_gate.py", cmd], cwd=d, env=env,
+                                  capture_output=True, text=True, timeout=60)
+            self.assertEqual(done.returncode, 3, (cmd, done.stdout, done.stderr))
+            self.assertEqual(json.loads(done.stdout)["code"], "policy_mode_disabled", cmd)
+        self.assertFalse((d / "decision.json").exists())
+        self.assertFalse(marker.exists())
+
+    def test_workflow_offers_founder_mode_only(self):
+        wf = WorkflowStatic.wf
+        mode_block = wf.split("\n      mode:\n", 1)[1].split("\n      merge_method:\n", 1)[0]
+        self.assertIn("options: [founder]", mode_block)
+        self.assertIn("default: founder", mode_block)
+        self.assertNotIn("policy", mode_block)
+        self.assertNotIn("faraday-review", wf)
+        self.assertNotIn("A0", wf)
 
 
 if __name__ == "__main__":

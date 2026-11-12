@@ -12,7 +12,7 @@
    - the gate's workspace files (`validated.json`, `evidence.json`, `decision.json`).
 
    Every other path refuses too, unless it matches the documentation allowlist `gate_repository_mergeable_paths` (`*.md`, `*.template`); that refusal is `gate_repository_path_not_allowlisted`. Matching is case-insensitive, and renames count both their old and new paths.
-3. **CI.** At least one check run exists; every check run at the head completed with `success` or `skipped`; every commit status is `success`; and each policy-required context is satisfied by a **GitHub Actions** check run. A commit status cannot satisfy a required context, because any user token can forge one.
+3. **CI.** At least one check run exists; every check run at the head completed with `success` or `skipped`; every commit status is `success`; and each policy-required context is satisfied by a **GitHub Actions** check run. A commit status cannot satisfy a required context. Required contexts only add CI requirements and never authorize a merge: any workflow in the target repository can create a check run, so check runs are evidence, not authority.
 4. **Codex.**
    - A `chatgpt-codex-connector[bot]` receipt names this head ("Didn't find any major issues", with "Reviewed commit" matching at least the first 10 hex characters).
    - Codex left no review at this head.
@@ -20,9 +20,11 @@
 5. **Independent review evidence** at this head: a PR comment containing
    `<!-- independent-review:v1 {"head_sha":"<sha>","verdict":"PASS","critical":0,"high":0,"medium":0,"reviewer":"..."} -->`.
    This is evidence, not authority.
-6. **Authorization:**
-   - `mode=founder`: an SSH signature by the founder key, `SHA256:yhaDzjdnB4aFL11XaMxhjHuTYdLwlQXw6L+rS6BILDE`, namespace `faraday-merge-go`, over the exact decision message. That key is not on the agent host, so agents cannot produce this signature.
-   - `mode=policy`: a GitHub Actions check run `faraday-review / governed-summary` at the head that reports `merge_authorized: true`, `risk_class: green` and `approval_class: A0|A1`, and no protected path is touched. Faraday Review Phase 1 never authorizes, so **policy mode refuses today by design**.
+6. **Authorization: a founder signature only.** The founder key, `SHA256:yhaDzjdnB4aFL11XaMxhjHuTYdLwlQXw6L+rS6BILDE`, must sign the exact decision message in namespace `faraday-merge-go`. That key is not on the agent host, so agents cannot produce this signature.
+   - **Policy mode is disabled.** It previously accepted a Faraday Review check run (A0/A1), and any workflow's `GITHUB_TOKEN` can create a check run with that name, so the authorization was forgeable.
+   - The workflow offers only `mode=founder`. `merge_gate.py` refuses `policy` (`policy_mode_disabled`) and any other mode (`invalid_mode`) at validation, before any token is minted, and again at evaluation.
+   - No check run, comment or policy key can stand in for the signature.
+   - Re-enabling A0/A1 merges is a separately authorized Faraday Review milestone. It needs an authorization source that a workflow token cannot forge.
 
 ## Trusted execution
 Every Python step runs as `python3 -I`, so neither the script directory, the working directory nor `PYTHON*` variables reach `sys.path`. Without isolated mode, `merge_gate.py` refuses (`interpreter_not_isolated`) before it imports anything that searches `sys.path`. Before it decides, it also refuses if any repository directory is importable (`untrusted_import_path`) or any loaded module came from the repository (`untrusted_module_loaded`). A planted `scripts/json.py` therefore never executes, and it cannot be merged by the bot in the first place.

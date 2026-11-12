@@ -20,12 +20,11 @@ A merge is allowed only when ALL of these hold for the input head SHA:
   * Codex: a chatgpt-codex-connector receipt names this head as clean, Codex
     left no review at this head, and no unresolved, non-outdated review thread;
   * independent review evidence for this head: verdict PASS, 0 critical/high/medium;
-  * authorization:
-      founder mode  -> an SSH signature by the founder key (namespace
-                       faraday-merge-go) over the exact decision message;
-      policy mode   -> a Faraday Review check run at the head that reports
-                       merge_authorized=true for an A0/A1 (green) class, and
-                       no protected path is touched.
+  * authorization: an SSH signature by the founder key (namespace
+    faraday-merge-go) over the exact decision message. That is the only authority.
+    Policy mode (Faraday Review A0/A1) is disabled: a check run is not authority,
+    because any workflow's GITHUB_TOKEN can create one, so every non-founder
+    mode refuses (policy_mode_disabled).
 Anything missing, unreadable or ambiguous is REFUSE.
 
 Run only as ``python3 -I scripts/merge_gate.py``. Without isolated mode the script
@@ -71,12 +70,11 @@ OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 PR_RE = re.compile(r"^[1-9][0-9]{0,6}$")
-MODES = ("founder", "policy")
+MODES = ("founder",)  # policy mode is disabled; see _require_founder_mode
 METHODS = ("squash", "merge", "rebase")
 OK_CONCLUSIONS = {"success", "skipped"}
 TRUSTED_CHECK_APP = "github-actions"  # user tokens can forge commit statuses, not Actions check runs
 INDEPENDENT_RE = re.compile(r"<!--\s*independent-review:v1\s+(\{.*?\})\s*-->", re.S)
-FR_AUTH_RE = re.compile(r"faraday-merge-authorization:v1\s+(\{.*?\})", re.S)
 
 
 GATE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -127,11 +125,17 @@ def validate_inputs(owner: str, repo: str, pr: str, sha: str, mode: str, method:
         raise Refuse("invalid_pr_number")
     if not SHA_RE.fullmatch(sha or ""):
         raise Refuse("invalid_head_sha", "a full 40-hex lowercase SHA is required")
-    if mode not in MODES:
-        raise Refuse("invalid_mode")
+    _require_founder_mode(mode)
     if method not in METHODS:
         raise Refuse("invalid_merge_method")
     return {"owner": owner, "repo": name, "pr": int(pr), "head_sha": sha, "mode": mode, "method": method}
+
+
+def _require_founder_mode(mode: Any) -> None:
+    if isinstance(mode, str) and mode.strip().lower() == "policy":
+        raise Refuse("policy_mode_disabled", "only a founder signature authorizes a merge")
+    if mode not in MODES:
+        raise Refuse("invalid_mode")
 
 
 def decision_message(owner: str, repo: str, pr: int, sha: str, method: str) -> bytes:
@@ -349,39 +353,17 @@ def verify_founder_signature(signature_b64: str, inp: dict, allowed_signers: Pat
         raise Refuse("founder_signature_invalid")
 
 
-def _check_policy_authorization(ev: dict, inp: dict, paths: list[str], policy: dict) -> dict:
-    if any(_match(p, policy["protected_paths"]) for p in paths):
-        raise Refuse("protected_path_requires_founder")
-    for run in ev["check_runs"]:
-        if (run.get("name") != policy["faraday_review_check"] or run.get("conclusion") != "success"
-                or (run.get("app") or {}).get("slug") != TRUSTED_CHECK_APP):
-            continue
-        m = FR_AUTH_RE.search(((run.get("output") or {}).get("text") or ""))
-        if not m:
-            continue
-        try:
-            auth = json.loads(m.group(1))
-        except ValueError:
-            continue
-        if (auth.get("head_sha") == inp["head_sha"] and auth.get("merge_authorized") is True
-                and auth.get("risk_class") == "green" and auth.get("approval_class") in ("A0", "A1")):
-            return auth
-    raise Refuse("policy_authorization_missing", "no Faraday Review merge authorization at this head")
-
-
 def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
              allowed_signers: Path | None = None) -> dict[str, Any]:
+    _require_founder_mode(inp.get("mode"))  # again here: callers cannot bypass validate_inputs
     _check_pr(ev, inp)
     paths = _changed_paths(ev)
     _check_gate_self(ev, inp, paths, policy)
     _check_ci(ev, inp, policy)
     _check_codex(ev, inp)
     independent = _check_independent(ev, inp)
-    if inp["mode"] == "founder":
-        verify_founder_signature(signature_b64, inp, allowed_signers or Path(policy["allowed_signers"]))
-        authority = {"type": "founder_signature", "namespace": SIGNATURE_NAMESPACE}
-    else:
-        authority = {"type": "faraday_review", **_check_policy_authorization(ev, inp, paths, policy)}
+    verify_founder_signature(signature_b64, inp, allowed_signers or Path(policy["allowed_signers"]))
+    authority = {"type": "founder_signature", "namespace": SIGNATURE_NAMESPACE}
     return {"gate_version": GATE_VERSION, "decision": "ALLOW", **inp, "files": len(paths),
             "independent_review": {k: independent.get(k) for k in ("reviewer", "verdict")},
             "authority": authority}

@@ -2,8 +2,8 @@
 #
 # Founder-dispatched only. Refuses unless scripts/merge_gate.py ALLOWs the exact
 # head SHA: current CI at that head, a clean Codex receipt at that head, independent
-# review evidence at that head, and an authorization (a founder SSH signature over the
-# exact decision, or a Faraday Review merge authorization for A0/A1).
+# review evidence at that head, and a founder SSH signature over the exact decision.
+# Policy mode (Faraday Review A0/A1) is disabled: the gate refuses any other mode.
 #
 # Token safety:
 #   * workflow_dispatch only; the gate job runs only from main and only when both
@@ -38,10 +38,11 @@ on:
         required: true
         type: string
       mode:
-        description: "founder (signed founder decision) or policy (Faraday Review A0/A1)"
+        description: "founder only (a signed founder decision is the sole authority)"
         required: true
+        default: founder
         type: choice
-        options: [founder, policy]
+        options: [founder]
       merge_method:
         description: "squash | merge | rebase"
         required: true
@@ -49,8 +50,8 @@ on:
         type: choice
         options: [squash, merge, rebase]
       founder_signature:
-        description: "founder mode: base64 of the armored SSH signature (namespace faraday-merge-go)"
-        required: false
+        description: "base64 of the armored founder SSH signature (namespace faraday-merge-go)"
+        required: true
         type: string
 
 permissions: {}
