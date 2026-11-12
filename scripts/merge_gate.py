@@ -74,13 +74,15 @@ SIGNATURE_NAMESPACE = "faraday-merge-go"
 SIGNER_IDENTITY = "founder"
 OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+REPO_FULL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 PR_RE = re.compile(r"^[1-9][0-9]{0,6}$")
 MODES = ("founder",)  # policy mode is disabled; see _require_founder_mode
 METHODS = ("squash", "merge", "rebase")
 OK_CONCLUSIONS = {"success", "skipped"}
 TRUSTED_CHECK_APP = "github-actions"  # user tokens can forge commit statuses, not Actions check runs
-ADR_STATUS_RE = re.compile(r"^##[ \t]+Status[ \t]*\n\s*(\S[^\n]*)", re.M)
+ADR_STATUS_HEADING_RE = re.compile(r"^##[ \t]+Status[ \t]*$")
+ADR_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 INDEPENDENT_RE = re.compile(r"<!--\s*independent-review:v1\s+(\{.*?\})\s*-->", re.S)
 
 
@@ -175,14 +177,73 @@ def require_activation(policy: dict, variable: str, owner: str) -> dict:
     return adr
 
 
+def adr_status(text: str) -> str:
+    """The single authoritative Status value of an ADR.
+
+    HTML comments and fenced code blocks are removed first, so an example or
+    commented-out "## Status / Accepted" cannot be read as the real status.
+    Exactly one level-2 Status heading must remain; zero or several refuse.
+    """
+    text = ADR_HTML_COMMENT_RE.sub("", text.replace("\r\n", "\n"))
+    lines, in_fence, fence = [], False, ""
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith(("```", "~~~")):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence, fence = True, marker
+                continue
+            if marker == fence:
+                in_fence = False
+                continue
+        if not in_fence:
+            lines.append(line)
+    if in_fence:
+        raise Refuse("governing_adr_ambiguous", "unterminated code fence")
+    if "<!--" in "\n".join(lines):
+        raise Refuse("governing_adr_ambiguous", "unterminated HTML comment")
+    heads = [i for i, line in enumerate(lines) if ADR_STATUS_HEADING_RE.match(line)]
+    if len(heads) != 1:
+        raise Refuse("governing_adr_ambiguous", f"{len(heads)} Status sections")
+    for line in lines[heads[0] + 1:]:
+        if line.startswith("#"):
+            break
+        if line.strip():
+            return line.strip()
+    raise Refuse("governing_adr_ambiguous", "empty Status section")
+
+
 def _check_governing_adr(ev: dict, policy: dict) -> None:
     governing_adr(policy)
     text = ev.get("governing_adr")
     if not isinstance(text, str):
         raise Refuse("governing_adr_unreadable")
-    m = ADR_STATUS_RE.search(text)
-    if not m or not re.match(r"Accepted\b", m.group(1)):
-        raise Refuse("governing_adr_not_accepted", m.group(1)[:80] if m else "no Status section")
+    status = adr_status(text)
+    if not re.match(r"Accepted\b", status):
+        raise Refuse("governing_adr_not_accepted", status[:80])
+
+
+def recheck_activation(token: str, gate_repo: str, variable: str, owner: str) -> dict:
+    """Live re-check of both repository-held kill-switch layers immediately before a write token
+    is minted and again before the merge call: the policy file and the governing ADR are re-read
+    from main, so disabling either after the gate decided still stops an in-flight run."""
+    if not REPO_FULL_RE.fullmatch(gate_repo):
+        raise Refuse("policy_invalid", "gate repository")
+    try:
+        doc = _api(token, f"https://api.github.com/repos/{gate_repo}/contents/policy/merge-policy.json?ref=main")
+        live_policy = json.loads(base64.b64decode(doc["content"]).decode("utf-8"))
+    except Refuse:
+        raise
+    except Exception as exc:  # noqa: BLE001 - unreadable live policy refuses
+        raise Refuse("policy_unreadable", type(exc).__name__) from exc
+    adr = require_activation(live_policy, variable, owner)
+    try:
+        doc = _api(token, f"https://api.github.com/repos/{adr['repository']}/contents/{adr['path']}?ref=main")
+        text = base64.b64decode(doc["content"]).decode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        raise Refuse("governing_adr_unreadable", type(exc).__name__) from exc
+    _check_governing_adr({"governing_adr": text}, live_policy)
+    return {"activation": "live", "adr": f"{adr['repository']}/{adr['path']}"}
 
 
 # ---- evidence collection (read-only token) -----------------------------------------------
@@ -421,7 +482,7 @@ def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
 def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="merge_gate.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("validate", "collect", "evaluate"):
+    for name in ("validate", "collect", "evaluate", "recheck"):
         p = sub.add_parser(name)
         p.add_argument("--evidence", default="evidence.json")
         p.add_argument("--policy", default="policy/merge-policy.json")
@@ -436,6 +497,10 @@ def _main(argv: list[str] | None = None) -> int:
         adr = require_activation(policy, env.get("IN_ACTIVATION", ""), inp["owner"])
         if args.cmd == "validate":
             print(json.dumps({"valid": True, **inp, "adr_repo": adr["repository"].partition("/")[2]}))
+            return 0
+        if args.cmd == "recheck":
+            print(json.dumps(recheck_activation(env["GATE_READ_TOKEN"], env.get("GATE_REPO", ""),
+                                                env.get("IN_ACTIVATION", ""), inp["owner"])))
             return 0
         if args.cmd == "collect":
             ev = collect(env["GATE_READ_TOKEN"], inp["owner"], inp["repo"], inp["pr"], inp["head_sha"], adr)

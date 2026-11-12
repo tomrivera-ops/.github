@@ -307,7 +307,8 @@ class WorkflowStatic(unittest.TestCase):
 
     def test_default_permissions_none_and_scoped_tokens(self):
         self.assertIn("\npermissions: {}\n", self.wf)
-        self.assertEqual(self.wf.count("repositories: ${{"), 2)
+        # gate read token, merge-job live-recheck read token, merge write token
+        self.assertEqual(self.wf.count("repositories: ${{"), 3)
         self.assertIn("permission-contents: read", self.wf)
         self.assertIn("permission-contents: write", self.wf)
         self.assertNotIn("permission-administration", self.wf)
@@ -325,7 +326,9 @@ class WorkflowStatic(unittest.TestCase):
         self.assertNotIn("--approve", self.wf)
         self.assertNotIn("--admin", self.wf)
         self.assertNotIn("pull_request.head", self.wf)
-        self.assertEqual(self.wf.count("actions/checkout@"), 1)
+        # gate job + merge job (live recheck); both check out this gate repo only, never the PR
+        self.assertEqual(self.wf.count("actions/checkout@"), 2)
+        self.assertEqual(self.wf.count("persist-credentials: false"), 2)
 
     def test_actions_pinned_to_full_shas(self):
         for use in re.findall(r"^\s*(?:-\s+)?uses:\s*(\S+)", self.wf, re.M):
@@ -694,9 +697,12 @@ class KillSwitch(unittest.TestCase):
     def test_governing_adr_must_be_accepted(self):
         inp = inputs()
         for text in (ACCEPTED_ADR.replace("Accepted", "Proposed"), "## Status\nNot Accepted\n",
-                     ACCEPTED_ADR.replace("## Status", "## Context"), "## Status\nAcceptedish\n"):
+                     "## Status\nAcceptedish\n"):
             ev = evidence(governing_adr=text)
             self.refuse("governing_adr_not_accepted", lambda: run(ev, inp))
+        # No Status section at all: refused as ambiguous (stricter parser, Codex P1 3cb5e63).
+        ev = evidence(governing_adr=ACCEPTED_ADR.replace("## Status", "## Context"))
+        self.refuse("governing_adr_ambiguous", lambda: run(ev, inp))
         ev = evidence()
         del ev["governing_adr"]
         self.refuse("governing_adr_unreadable", lambda: run(ev, inp))
@@ -735,6 +741,106 @@ class KillSwitch(unittest.TestCase):
         merge = WorkflowStatic.wf.split("\n  merge:\n", 1)[1]
         self.assertLess(merge.index('[ "${now_sha}" != "${IN_SHA}" ]'), merge.index("-X PUT"))
         self.assertIn('[ "${now_base}" != "${default_branch}" ]', merge)
+
+
+class AdrStatusParsing(unittest.TestCase):
+    """Codex P1 (3cb5e63): only the single authoritative Status section counts."""
+
+    def status_refuses(self, text, code):
+        with self.assertRaises(mg.Refuse) as cm:
+            mg._check_governing_adr({"governing_adr": text}, POLICY)
+        self.assertEqual(cm.exception.code, code)
+
+    def test_accepted_passes(self):
+        mg._check_governing_adr({"governing_adr": ACCEPTED_ADR}, POLICY)
+
+    def test_html_comment_spoof_refused(self):
+        text = "# ADR-0014\n<!--\n## Status\nAccepted (fake)\n-->\n\n## Status\nProposed\n"
+        self.status_refuses(text, "governing_adr_not_accepted")
+
+    def test_fenced_example_spoof_refused(self):
+        text = "# ADR-0014\n```md\n## Status\nAccepted (example)\n```\n\n## Status\nProposed\n"
+        self.status_refuses(text, "governing_adr_not_accepted")
+
+    def test_tilde_fence_spoof_refused(self):
+        text = "# ADR\n~~~\n## Status\nAccepted\n~~~\n## Status\nProposed — draft\n"
+        self.status_refuses(text, "governing_adr_not_accepted")
+
+    def test_duplicate_status_sections_refused(self):
+        text = "# ADR\n## Status\nAccepted\n\n## Status\nSuperseded\n"
+        self.status_refuses(text, "governing_adr_ambiguous")
+
+    def test_no_status_section_refused(self):
+        self.status_refuses("# ADR\n## Decision\nAccepted\n", "governing_adr_ambiguous")
+
+    def test_unterminated_fence_refused(self):
+        self.status_refuses("# ADR\n## Status\nAccepted\n```\n## Status\nProposed\n", "governing_adr_ambiguous")
+
+    def test_unterminated_comment_refused(self):
+        self.status_refuses("# ADR\n## Status\nAccepted\n<!-- x\n", "governing_adr_ambiguous")
+
+    def test_level3_status_is_not_authoritative(self):
+        self.status_refuses("# ADR\n### Status\nAccepted\n## Status\nProposed\n", "governing_adr_not_accepted")
+
+    def test_shipped_adr_0014_proposed_is_refused(self):
+        adr = Path(os.environ.get("ADR_0014_PATH", "/nonexistent"))
+        if not adr.is_file():
+            self.skipTest("set ADR_0014_PATH to the agent-contracts ADR-0014 file to run")
+        self.status_refuses(adr.read_text(), "governing_adr_not_accepted")
+
+
+class LiveActivationRecheck(unittest.TestCase):
+    """Codex P1 (3cb5e63): disabling policy or withdrawing the ADR after the gate stops the merge."""
+
+    def run_recheck(self, live_policy, adr_text):
+        def fake_api(token, url, method="GET", body=None):
+            if url.endswith("/contents/policy/merge-policy.json?ref=main"):
+                return {"content": base64.b64encode(json.dumps(live_policy).encode()).decode()}
+            if "/contents/" in url and url.endswith("?ref=main"):
+                return {"content": base64.b64encode(adr_text.encode()).decode()}
+            raise AssertionError(url)
+        orig = mg._api
+        mg._api = fake_api
+        try:
+            return mg.recheck_activation("t", "tomrivera-ops/.github", "true", "tomrivera-ops")
+        finally:
+            mg._api = orig
+
+    def test_live_ok(self):
+        self.assertEqual(self.run_recheck(POLICY, ACCEPTED_ADR)["activation"], "live")
+
+    def test_policy_disabled_after_gate_refuses(self):
+        live = copy.deepcopy(POLICY)
+        live["activation"]["enabled"] = False
+        with self.assertRaises(mg.Refuse) as cm:
+            self.run_recheck(live, ACCEPTED_ADR)
+        self.assertEqual(cm.exception.code, "bot_merge_not_activated")
+
+    def test_adr_withdrawn_after_gate_refuses(self):
+        with self.assertRaises(mg.Refuse) as cm:
+            self.run_recheck(POLICY, ACCEPTED_ADR.replace("Accepted (2026-12-01)", "Suspended (2026-12-02)"))
+        self.assertEqual(cm.exception.code, "governing_adr_not_accepted")
+
+    def test_variable_off_refuses(self):
+        orig = mg._api
+        mg._api = lambda *a, **k: {"content": base64.b64encode(json.dumps(POLICY).encode()).decode()}
+        try:
+            with self.assertRaises(mg.Refuse) as cm:
+                mg.recheck_activation("t", "tomrivera-ops/.github", "false", "tomrivera-ops")
+        finally:
+            mg._api = orig
+        self.assertEqual(cm.exception.code, "bot_merge_not_activated")
+
+    def test_bad_gate_repo_refuses(self):
+        with self.assertRaises(mg.Refuse):
+            mg.recheck_activation("t", "not a repo", "true", "tomrivera-ops")
+
+    def test_merge_job_rechecks_before_write_token_and_before_put(self):
+        merge = WorkflowStatic.wf.split("\n  merge:\n", 1)[1]
+        first = merge.index("merge_gate.py recheck")
+        self.assertLess(first, merge.index("Mint merge token"))
+        self.assertLess(merge.index("merge_gate.py recheck", first + 1), merge.index("-X PUT"))
+        self.assertIn("permission-contents: read", merge.split("Mint merge token", 1)[0])
 
 
 if __name__ == "__main__":

@@ -53,6 +53,8 @@ ratified ADR-0014 supersedes ADR-0012 §1 for the scope it names. A merge needs 
 2. `policy/merge-policy.json` `activation.enabled` is `true`. This file can only change through a founder-merged PR, because the bot never merges `policy/`. Otherwise every subcommand refuses `bot_merge_not_activated` before any token is minted.
 3. The governing ADR named in `activation.governing_adr` is read live from `main` of its repository and its `## Status` line starts with `Accepted`. Otherwise the gate refuses `governing_adr_not_accepted` or `governing_adr_unreadable`. The shipped path is ADR-0014 (agent-contracts PR #13, Proposed, not on `main`): until it is merged AND ratified the gate refuses (`governing_adr_unreadable`, then `governing_adr_not_accepted`).
 
+   The Status is parsed strictly. HTML comments and fenced code blocks are ignored, and exactly one `## Status` section must remain; otherwise the gate refuses `governing_adr_ambiguous`. The merge job re-reads the policy file and the ADR live from `main` (`merge_gate.py recheck`) twice: before it mints the write token, and immediately before the merge call. Disabling `activation.enabled` or withdrawing the ADR therefore stops a run that the gate already allowed. The repository variable is evaluated again when the merge job starts.
+
 Activation never replaces the founder signature. It only permits the gate to evaluate.
 
 ## Emergency disable
