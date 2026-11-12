@@ -1,74 +1,168 @@
+# faraday-ci-bot gated merge (FARADAY-CI-BOT-HARDENING-001).
+#
+# Founder-dispatched only. Refuses unless scripts/merge_gate.py ALLOWs the exact
+# head SHA: current CI at that head, a clean Codex receipt at that head, independent
+# review evidence at that head, and an authorization (a founder SSH signature over the
+# exact decision, or a Faraday Review merge authorization for A0/A1).
+#
+# Token safety:
+#   * workflow_dispatch only; the gate job runs only from main and only when both
+#     github.actor and github.triggering_actor are the founder;
+#   * the gate job mints a READ-ONLY token scoped to the one target repository;
+#   * the merge job (environment faraday-merge) mints a contents/pull_requests write
+#     token scoped to the one repository, only after the gate ALLOWs, and merges with
+#     sha=<head> so GitHub rejects the merge if the head moved;
+#   * no approval is submitted (ADR-0012), no --admin, no PR code is checked out,
+#     and inputs reach scripts only through environment variables.
 name: CLI Approve & Merge
 
 on:
   workflow_dispatch:
     inputs:
       owner:
-        description: "Org or user owning the repo (e.g. tomrivera-ops)"
-        required: false
-        default: "tomrivera-ops"
+        description: "Org owning the repo (e.g. tomrivera-ops)"
+        required: true
+        type: string
       repo:
-        description: "Target repo (e.g. tomrivera-ops/faraday-validator)"
+        description: "Repository name or owner/name"
         required: true
+        type: string
       pr_number:
-        description: "PR number to approve and merge"
+        description: "PR number"
         required: true
+        type: string
+      head_sha:
+        description: "Exact 40-hex head SHA being merged"
+        required: true
+        type: string
+      mode:
+        description: "founder (signed founder decision) or policy (Faraday Review A0/A1)"
+        required: true
+        type: choice
+        options: [founder, policy]
       merge_method:
-        description: "merge | squash | rebase"
-        required: false
+        description: "squash | merge | rebase"
+        required: true
         default: squash
+        type: choice
+        options: [squash, merge, rebase]
+      founder_signature:
+        description: "founder mode: base64 of the armored SSH signature (namespace faraday-merge-go)"
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: faraday-merge-${{ inputs.owner }}-${{ inputs.pr_number }}
+  cancel-in-progress: false
 
 jobs:
-  approve-and-merge:
-    runs-on: ubuntu-latest
+  gate:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.actor == 'tomrivera-PSE' &&
+      github.triggering_actor == 'tomrivera-PSE'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      repo_name: ${{ steps.validate.outputs.repo_name }}
+    env:
+      IN_OWNER: ${{ inputs.owner }}
+      IN_REPO: ${{ inputs.repo }}
+      IN_PR: ${{ inputs.pr_number }}
+      IN_SHA: ${{ inputs.head_sha }}
+      IN_MODE: ${{ inputs.mode }}
+      IN_METHOD: ${{ inputs.merge_method }}
     steps:
-      - name: Generate bot token
-        id: app-token
-        uses: actions/create-github-app-token@v1
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs (before any token exists)
+        id: validate
+        run: |
+          python3 scripts/merge_gate.py validate > validated.json
+          python3 -c "import json;print('repo_name='+json.load(open('validated.json'))['repo'])" >> "$GITHUB_OUTPUT"
+
+      - name: Mint read-only token for the target repository
+        id: read-token
+        uses: actions/create-github-app-token@67018539274d69449ef7c02e8e71183d1719ab42 # v2.1.4
         with:
           app-id: ${{ secrets.FARADAY_APP_ID }}
           private-key: ${{ secrets.FARADAY_APP_PRIVATE_KEY }}
           owner: ${{ inputs.owner }}
+          repositories: ${{ steps.validate.outputs.repo_name }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-checks: read
+          permission-statuses: read
+          permission-issues: read
 
-      - name: Verify PR exists and is open
+      - name: Collect evidence
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          STATE=$(gh pr view ${{ inputs.pr_number }} \
-            --repo ${{ inputs.repo }} \
-            --json state --jq '.state')
-          if [ "$STATE" != "OPEN" ]; then
-            echo "PR #${{ inputs.pr_number }} is not OPEN (state: $STATE). Aborting."
-            exit 1
-          fi
+          GATE_READ_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: python3 scripts/merge_gate.py collect --evidence evidence.json
 
-      - name: Approve PR
+      - name: Evaluate merge gate
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          IN_SIGNATURE: ${{ inputs.founder_signature }}
         run: |
-          gh pr review ${{ inputs.pr_number }} \
-            --approve \
-            --body "Approved via faraday-ci-bot on behalf of repo owner." \
-            --repo ${{ inputs.repo }}
+          python3 scripts/merge_gate.py evaluate --evidence evidence.json --decision decision.json
+          {
+            echo "### faraday-ci-bot merge gate: ALLOW"
+            echo '```json'
+            cat decision.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Merge PR
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          gh pr merge ${{ inputs.pr_number }} \
-            --${{ inputs.merge_method }} \
-            --delete-branch \
-            --repo ${{ inputs.repo }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: merge-gate-${{ github.run_id }}
+          path: |
+            validated.json
+            decision.json
+          if-no-files-found: ignore
+          retention-days: 90
 
-      - name: Confirm merge
+  merge:
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: faraday-merge
+    permissions: {}
+    env:
+      IN_OWNER: ${{ inputs.owner }}
+      IN_REPO_NAME: ${{ needs.gate.outputs.repo_name }}
+      IN_PR: ${{ inputs.pr_number }}
+      IN_SHA: ${{ inputs.head_sha }}
+      IN_METHOD: ${{ inputs.merge_method }}
+      IN_MODE: ${{ inputs.mode }}
+    steps:
+      - name: Mint merge token for the target repository only
+        id: write-token
+        uses: actions/create-github-app-token@67018539274d69449ef7c02e8e71183d1719ab42 # v2.1.4
+        with:
+          app-id: ${{ secrets.FARADAY_APP_ID }}
+          private-key: ${{ secrets.FARADAY_APP_PRIVATE_KEY }}
+          owner: ${{ inputs.owner }}
+          repositories: ${{ needs.gate.outputs.repo_name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Merge exactly the gated head
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.write-token.outputs.token }}
         run: |
-          STATE=$(gh pr view ${{ inputs.pr_number }} \
-            --repo ${{ inputs.repo }} \
-            --json state --jq '.state')
-          echo "PR #${{ inputs.pr_number }} final state: $STATE"
-          if [ "$STATE" != "MERGED" ]; then
-            echo "Merge failed — check PR status manually."
-            exit 1
-          fi
+          set -euo pipefail
+          title="faraday-ci-bot merge (gate v1, mode=${IN_MODE}, run=${GITHUB_RUN_ID})"
+          gh api -X PUT "repos/${IN_OWNER}/${IN_REPO_NAME}/pulls/${IN_PR}/merge" \
+            -f sha="${IN_SHA}" -f merge_method="${IN_METHOD}" \
+            -f commit_title="${title}" \
+            -f commit_message="faraday-merge-gate:v1 head=${IN_SHA} mode=${IN_MODE} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            > merge.json
+          echo "### merged ${IN_OWNER}/${IN_REPO_NAME}#${IN_PR} at ${IN_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          cat merge.json >> "$GITHUB_STEP_SUMMARY"

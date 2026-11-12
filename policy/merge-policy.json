@@ -1,0 +1,11 @@
+{
+  "policy_version": "1",
+  "gate_repository": "tomrivera-ops/.github",
+  "gate_paths": [".github/workflows/cli-approve-merge.yml", "scripts/merge_gate.py", "scripts/test_merge_gate.py", "policy/*"],
+  "allowed_signers": "policy/founder-allowed-signers",
+  "faraday_review_check": "faraday-review / governed-summary",
+  "protected_paths": [".github/*", ".github/**", "*/.github/*", "CODEOWNERS", "*/CODEOWNERS", "schemas/*", "**/schemas/*",
+                      "tools/guards/*", "policy/*", "*.lock", "package-lock.json", "pnpm-lock.yaml", "uv.lock",
+                      "infra/*", "deploy/*", "*.tf", "Dockerfile", "*/Dockerfile"],
+  "required_contexts": {}
+}
