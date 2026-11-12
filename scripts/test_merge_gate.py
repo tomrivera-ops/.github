@@ -260,6 +260,26 @@ class Refusals(unittest.TestCase):
         ev["repo"]["full_name"] = "tomrivera-ops/.github"
         self.refuse("gate_self_modification", ev, inp)
 
+    def test_gate_self_modification_cannot_hide_behind_owner_case(self):
+        """Codex finding at 6d404fa: GitHub names are case-insensitive."""
+        for owner in ("Tomrivera-ops", "TOMRIVERA-OPS"):
+            inp = inputs(owner=owner, repo=".github")
+            ev = evidence(files=[{"filename": "scripts/merge_gate.py"}])
+            ev["repo"]["full_name"] = "tomrivera-ops/.github"
+            self.refuse("gate_self_modification", ev, inp)
+
+    def test_collected_repository_must_match_inputs(self):
+        ev = evidence()
+        ev["repo"]["full_name"] = "someone-else/ecosystem-audit"
+        self.refuse("repo_identity_mismatch", ev)
+
+    def test_required_contexts_apply_regardless_of_owner_case(self):
+        policy = copy.deepcopy(POLICY)
+        policy["required_contexts"] = {"tomrivera-ops/ecosystem-audit": ["tests"]}
+        with self.assertRaises(mg.Refuse) as caught:
+            run(evidence(), inputs(owner="TOMRIVERA-OPS"), policy=policy)
+        self.assertEqual(caught.exception.code, "required_context_missing")
+
     def test_fork_head(self):
         ev = evidence()
         ev["pr"]["head"]["repo"]["full_name"] = "attacker/ecosystem-audit"

@@ -177,9 +177,21 @@ def _match(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, p) for p in patterns)
 
 
-def _check_gate_self(inp: dict, paths: list[str], policy: dict) -> None:
-    target = f"{inp['owner']}/{inp['repo']}"
-    if target == policy["gate_repository"] and any(_match(p, policy["gate_paths"]) for p in paths):
+def _canonical_repo(ev: dict, inp: dict) -> str:
+    """GitHub's own full_name for the target, compared case-insensitively.
+
+    Owner and repo names are case-insensitive on GitHub, so input spelling must
+    never decide which rules apply.
+    """
+    name = (ev.get("repo") or {}).get("full_name")
+    if not isinstance(name, str) or name.lower() != f"{inp['owner']}/{inp['repo']}".lower():
+        raise Refuse("repo_identity_mismatch", "collected repository does not match the inputs")
+    return name.lower()
+
+
+def _check_gate_self(ev: dict, inp: dict, paths: list[str], policy: dict) -> None:
+    target = _canonical_repo(ev, inp)
+    if target == policy["gate_repository"].lower() and any(_match(p, policy["gate_paths"]) for p in paths):
         raise Refuse("gate_self_modification", "the gate never merges changes to itself")
 
 
@@ -202,8 +214,9 @@ def _check_ci(ev: dict, inp: dict, policy: dict) -> None:
             raise Refuse("status_not_success", f"{ctx}={state}")
     # Required contexts count only when produced by GitHub Actions check runs.
     trusted = {r.get("name") for r in runs if (r.get("app") or {}).get("slug") == TRUSTED_CHECK_APP}
-    key = f"{inp['owner']}/{inp['repo']}"
-    for ctx in policy.get("required_contexts", {}).get(key, []):
+    key = _canonical_repo(ev, inp)
+    required = {k.lower(): v for k, v in policy.get("required_contexts", {}).items()}
+    for ctx in required.get(key, []):
         if ctx not in trusted:
             raise Refuse("required_context_missing", ctx)
 
@@ -299,7 +312,7 @@ def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
              allowed_signers: Path | None = None) -> dict[str, Any]:
     _check_pr(ev, inp)
     paths = _changed_paths(ev)
-    _check_gate_self(inp, paths, policy)
+    _check_gate_self(ev, inp, paths, policy)
     _check_ci(ev, inp, policy)
     _check_codex(ev, inp)
     independent = _check_independent(ev, inp)
