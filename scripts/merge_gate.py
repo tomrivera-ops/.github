@@ -8,24 +8,45 @@ Subcommands
   validate   check workflow inputs (run before any token is minted)
   collect    read PR evidence through the GitHub API with a READ-ONLY token
   evaluate   apply the policy to collected evidence; exit 0 only on ALLOW
+  premerge   live re-read immediately before a write token and before PUT /merge
+  recheck    live re-read of the kill switch only (policy file + governing ADR)
 
 A merge is allowed only when ALL of these hold for the input head SHA:
   * PR open, not draft, same-repo head (no forks), base == default branch,
-    head.sha == input head_sha;
+    head.sha == input head_sha, the default branch tip == input base_sha and the
+    head is not behind it; the PR author is readable and is not the merge App;
   * the PR does not touch the merge gate itself (never self-merge the gate); in the
     gate repository only allowlisted documentation may change, so nothing that can
     execute, configure or decide the gate can be merged by the bot;
   * every check run at the head is completed with success/skipped, at least one
-    exists, every commit status is success, and policy-required contexts pass;
+    exists, every commit status is success, the target repository has a configured,
+    non-empty required-context list, and every required context is a GitHub Actions
+    check run whose conclusion is exactly success (skipped/neutral/missing refuse);
   * Codex: a chatgpt-codex-connector receipt names this head as clean, Codex
-    left no review at this head, and no unresolved, non-outdated review thread;
-  * independent review evidence for this head: verdict PASS, 0 critical/high/medium;
+    left no review at this head, no unresolved, non-outdated review thread, and the
+    latest codex-review-state:v1 names this head, completed, with no unresolved findings;
+  * independent review evidence for this head, from a policy-allowlisted reviewer that
+    is not the PR author (the founder account and the merge App can never be listed):
+    the latest such record has verdict PASS and integer 0 critical/high/medium;
   * authorization: an SSH signature by the founder key (namespace
-    faraday-merge-go) over the exact decision message. That is the only authority.
+    faraday-merge-go) over the exact v2 decision message, which binds repository,
+    PR, head SHA, base SHA, merge method, policy version and an expiry no further
+    ahead than the policy's grant.max_ttl_hours. That is the only authority.
     Policy mode (Faraday Review A0/A1) is disabled: a check run is not authority,
     because any workflow's GITHUB_TOKEN can create one, so every non-founder
     mode refuses (policy_mode_disabled).
 Anything missing, unreadable or ambiguous is REFUSE.
+
+Activation kill-switch (ADR-0012 section 1 forbids bot merges today): every
+subcommand refuses ``bot_merge_not_activated`` unless BOTH the policy flag
+``activation.enabled`` is true AND the repository variable
+FARADAY_BOT_MERGE_ENABLED is exactly "true"; evaluate additionally refuses unless
+the governing ADR named in the policy is read live, its Status is Accepted, and its
+git blob SHA equals the pin ``activation.governing_adr.blob_sha`` (the ADR's repository
+is private on GitHub Free and cannot be protected, so its text alone is not trusted).
+premerge also refuses unless this workflow is still enabled (read live by run id), the
+live policy is byte-for-byte (canonically) the evaluated one, and the grant is unexpired
+after every live read.
 
 Run only as ``python3 -I scripts/merge_gate.py``. Without isolated mode the script
 directory is sys.path[0] and a repository file such as scripts/json.py would shadow
@@ -50,31 +71,45 @@ if __name__ == "__main__":
 
 import argparse
 import base64
+import calendar
 import fnmatch
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 GATE_VERSION = "1"
 CODEX_BOT = "chatgpt-codex-connector[bot]"
+MERGE_BOT = "faraday-ci-bot[bot]"
 FOUNDER_LOGIN = "tomrivera-PSE"
+DECISION_VERSION = "v2"
 SIGNATURE_NAMESPACE = "faraday-merge-go"
 SIGNER_IDENTITY = "founder"
 OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+REPO_FULL_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 PR_RE = re.compile(r"^[1-9][0-9]{0,6}$")
+EXPIRES_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+POLICY_VERSION_RE = re.compile(r"^[1-9][0-9]{0,5}$")
+MAX_GRANT_TTL_HOURS = 168
 MODES = ("founder",)  # policy mode is disabled; see _require_founder_mode
 METHODS = ("squash", "merge", "rebase")
 OK_CONCLUSIONS = {"success", "skipped"}
 TRUSTED_CHECK_APP = "github-actions"  # user tokens can forge commit statuses, not Actions check runs
+ADR_STATUS_HEADING_RE = re.compile(r"^##[ \t]+Status[ \t]*$")
+ADR_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 INDEPENDENT_RE = re.compile(r"<!--\s*independent-review:v1\s+(\{.*?\})\s*-->", re.S)
+CODEX_STATE_RE = re.compile(r"<!--\s*codex-review-state:v1\s+(\{.*?\})\s*-->", re.S)
 
 
 GATE_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -109,7 +144,8 @@ def assert_trusted_modules() -> None:
 # ---- inputs -------------------------------------------------------------------------
 
 
-def validate_inputs(owner: str, repo: str, pr: str, sha: str, mode: str, method: str) -> dict[str, Any]:
+def validate_inputs(owner: str, repo: str, pr: str, sha: str, mode: str, method: str,
+                    base_sha: str, expires_at: str) -> dict[str, Any]:
     if not OWNER_RE.fullmatch(owner or ""):
         raise Refuse("invalid_owner")
     full = repo or ""
@@ -128,7 +164,16 @@ def validate_inputs(owner: str, repo: str, pr: str, sha: str, mode: str, method:
     _require_founder_mode(mode)
     if method not in METHODS:
         raise Refuse("invalid_merge_method")
-    return {"owner": owner, "repo": name, "pr": int(pr), "head_sha": sha, "mode": mode, "method": method}
+    if not SHA_RE.fullmatch(base_sha or ""):
+        raise Refuse("invalid_base_sha", "the full 40-hex SHA of the default-branch tip is required")
+    if not EXPIRES_RE.fullmatch(expires_at or ""):
+        raise Refuse("invalid_expires_at", "UTC YYYY-MM-DDTHH:MM:SSZ is required")
+    try:
+        expires_epoch = calendar.timegm(time.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError as exc:
+        raise Refuse("invalid_expires_at", "not a real UTC time") from exc
+    return {"owner": owner, "repo": name, "pr": int(pr), "head_sha": sha, "mode": mode, "method": method,
+            "base_sha": base_sha, "expires_at": expires_at, "expires_epoch": expires_epoch}
 
 
 def _require_founder_mode(mode: Any) -> None:
@@ -138,8 +183,224 @@ def _require_founder_mode(mode: Any) -> None:
         raise Refuse("invalid_mode")
 
 
-def decision_message(owner: str, repo: str, pr: int, sha: str, method: str) -> bytes:
-    return f"faraday-merge-decision:v1\n{owner}/{repo}#{pr}\n{sha}\n{method}\n".encode()
+def decision_message(inp: dict, policy_version: str) -> bytes:
+    """The exact bytes the founder signs (ADR-0014 section 5 tuple, plus method, policy and expiry).
+
+    The repository is lower-cased because GitHub names are case-insensitive: the spelling used at
+    dispatch can neither break nor widen a decision.
+    """
+    repo = f"{inp['owner']}/{inp['repo']}".lower()
+    return (f"faraday-merge-decision:{DECISION_VERSION}\n"
+            f"repo={repo}\n"
+            f"pr={inp['pr']}\n"
+            f"head={inp['head_sha']}\n"
+            f"base={inp['base_sha']}\n"
+            f"method={inp['method']}\n"
+            f"policy={policy_version}\n"
+            f"expires={inp['expires_at']}\n").encode()
+
+
+def policy_version(policy: dict) -> str:
+    value = policy.get("policy_version")
+    if not isinstance(value, str) or not POLICY_VERSION_RE.fullmatch(value):
+        raise Refuse("policy_invalid", "policy_version")
+    return value
+
+
+def check_grant_window(inp: dict, policy: dict, now: float | None = None) -> None:
+    """A founder decision is an expiring grant: refuse once expired, or if it was issued for
+    longer than the policy allows (so a forgotten signature cannot stay usable)."""
+    grant = policy.get("grant")
+    ttl = grant.get("max_ttl_hours") if isinstance(grant, dict) else None
+    if type(ttl) is not int or not 1 <= ttl <= MAX_GRANT_TTL_HOURS:
+        raise Refuse("policy_invalid", "grant.max_ttl_hours")
+    now = time.time() if now is None else now
+    expires = inp.get("expires_epoch")
+    if type(expires) is not int:
+        raise Refuse("invalid_expires_at")
+    if now >= expires:
+        raise Refuse("grant_expired", inp.get("expires_at", ""))
+    if expires - now > ttl * 3600:
+        raise Refuse("grant_ttl_exceeds_policy", f"max {ttl}h")
+
+
+# ---- activation kill-switch ------------------------------------------------------------
+
+
+def git_blob_sha(data: bytes) -> str:
+    """Git's blob object id for ``data`` (what ``git hash-object`` prints)."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()  # noqa: S324 - git object id
+
+
+def policy_digest(policy: dict) -> str:
+    """Canonical digest of the whole policy: key order and whitespace never count, content always does."""
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def governing_adr(policy: dict) -> dict:
+    """The policy half of the kill-switch: refuse unless activation.enabled is literally true."""
+    act = policy.get("activation")
+    if not isinstance(act, dict) or act.get("enabled") is not True:
+        raise Refuse("bot_merge_not_activated", "policy activation.enabled is not true")
+    adr = act.get("governing_adr")
+    if not isinstance(adr, dict) or adr.get("required_status") != "Accepted" or not all(
+            isinstance(adr.get(k), str) and adr.get(k) for k in ("repository", "path")):
+        raise Refuse("policy_invalid", "activation.governing_adr")
+    if not isinstance(adr.get("blob_sha"), str) or not SHA_RE.fullmatch(adr["blob_sha"]):
+        raise Refuse("policy_invalid", "activation.governing_adr.blob_sha must pin the Accepted ADR")
+    return adr
+
+
+def require_activation(policy: dict, variable: str, owner: str) -> dict:
+    """Both halves of the kill-switch; runs for every subcommand, before any token is minted."""
+    adr = governing_adr(policy)
+    if variable != "true":
+        raise Refuse("bot_merge_not_activated", "repository variable FARADAY_BOT_MERGE_ENABLED is not 'true'")
+    adr_owner, _, adr_name = adr["repository"].partition("/")
+    if adr_owner.lower() != owner.lower() or not REPO_RE.fullmatch(adr_name):
+        raise Refuse("governing_adr_unreadable", "governing ADR must live under the target owner")
+    return adr
+
+
+def adr_status(text: str) -> str:
+    """The single authoritative Status value of an ADR.
+
+    HTML comments and fenced code blocks are removed first, so an example or
+    commented-out "## Status / Accepted" cannot be read as the real status.
+    Exactly one level-2 Status heading must remain; zero or several refuse.
+    """
+    text = ADR_HTML_COMMENT_RE.sub("", text.replace("\r\n", "\n"))
+    lines, in_fence, fence = [], False, ""
+    for line in text.split("\n"):
+        stripped = line.lstrip()
+        if stripped.startswith(("```", "~~~")):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence, fence = True, marker
+                continue
+            if marker == fence:
+                in_fence = False
+                continue
+        if not in_fence:
+            lines.append(line)
+    if in_fence:
+        raise Refuse("governing_adr_ambiguous", "unterminated code fence")
+    if "<!--" in "\n".join(lines):
+        raise Refuse("governing_adr_ambiguous", "unterminated HTML comment")
+    heads = [i for i, line in enumerate(lines) if ADR_STATUS_HEADING_RE.match(line)]
+    if len(heads) != 1:
+        raise Refuse("governing_adr_ambiguous", f"{len(heads)} Status sections")
+    for line in lines[heads[0] + 1:]:
+        if line.startswith("#"):
+            break
+        if line.strip():
+            return line.strip()
+    raise Refuse("governing_adr_ambiguous", "empty Status section")
+
+
+def _check_governing_adr(ev: dict, policy: dict) -> None:
+    adr = governing_adr(policy)
+    text = ev.get("governing_adr")
+    if not isinstance(text, str):
+        raise Refuse("governing_adr_unreadable")
+    status = adr_status(text)
+    if not re.match(r"Accepted\b", status):
+        raise Refuse("governing_adr_not_accepted", status[:80])
+    if git_blob_sha(text.encode("utf-8")) != adr["blob_sha"]:
+        raise Refuse("governing_adr_pin_mismatch", "the ADR on main is not the pinned Accepted text")
+
+
+def recheck_activation(token: str, gate_repo: str, variable: str, owner: str) -> dict:
+    """Live re-check of both repository-held kill-switch layers immediately before a write token
+    is minted and again before the merge call: the policy file and the governing ADR are re-read
+    from main, so disabling either after the gate decided still stops an in-flight run."""
+    if not REPO_FULL_RE.fullmatch(gate_repo):
+        raise Refuse("policy_invalid", "gate repository")
+    try:
+        doc = _api(token, f"https://api.github.com/repos/{gate_repo}/contents/policy/merge-policy.json?ref=main")
+        live_policy = json.loads(base64.b64decode(doc["content"]).decode("utf-8"))
+    except Refuse:
+        raise
+    except Exception as exc:  # noqa: BLE001 - unreadable live policy refuses
+        raise Refuse("policy_unreadable", type(exc).__name__) from exc
+    adr = require_activation(live_policy, variable, owner)
+    try:
+        doc = _api(token, f"https://api.github.com/repos/{adr['repository']}/contents/{adr['path']}?ref=main")
+        text = base64.b64decode(doc["content"]).decode("utf-8")
+    except Exception as exc:  # noqa: BLE001
+        raise Refuse("governing_adr_unreadable", type(exc).__name__) from exc
+    _check_governing_adr({"governing_adr": text}, live_policy)
+    return {"activation": "live", "adr": f"{adr['repository']}/{adr['path']}", "policy": live_policy}
+
+
+RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,19}$")
+
+
+def _workflow_active(token: str, gate_repo: str, run_id: str) -> None:
+    """Live emergency layer for an in-flight run. Repository variables are captured when a job
+    starts, and no token this workflow can mint may read them (create-github-app-token has no
+    variables permission; GITHUB_TOKEN has no variables scope). So the run re-reads its own
+    workflow's state: ``gh workflow disable`` stops a run that is already past the gate."""
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id) or not token:
+        raise Refuse("workflow_state_unreadable", "run id")
+    try:
+        run = _api(token, f"https://api.github.com/repos/{gate_repo}/actions/runs/{run_id}")
+        wf_id = (run or {}).get("workflow_id")
+        if type(wf_id) is not int:
+            raise Refuse("workflow_state_unreadable", "workflow id")
+        wf = _api(token, f"https://api.github.com/repos/{gate_repo}/actions/workflows/{wf_id}")
+    except Refuse:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise Refuse("workflow_state_unreadable", type(exc).__name__) from exc
+    if (wf or {}).get("state") != "active":
+        raise Refuse("workflow_not_active", str((wf or {}).get("state")))
+
+
+def premerge(token: str, inp: dict, policy: dict, gate_repo: str, variable: str, digest: str, *,
+             workflow_token: str = "", run_id: str = "", clock=None) -> dict:
+    """Run immediately before the write token is minted and again immediately before PUT /merge.
+
+    Read-only. Re-reads, live: the kill switch (policy on main + governing ADR), that the policy on
+    main is still the version the decision was signed under, the grant expiry, and the PR (open,
+    not draft, same head, same-repo head, base still the default branch), the default-branch tip and
+    this workflow's enabled state. The expiry is checked first and again after every live read.
+    """
+    clock = clock or time.time
+    if not DIGEST_RE.fullmatch(digest or ""):
+        raise Refuse("decision_digest_invalid")
+    check_grant_window(inp, policy, clock())
+    if not REPO_FULL_RE.fullmatch(gate_repo or ""):
+        raise Refuse("policy_invalid", "gate repository")
+    _workflow_active(workflow_token, gate_repo, run_id)
+    live = recheck_activation(token, gate_repo, variable, inp["owner"])
+    if policy_version(live["policy"]) != policy_version(policy) or policy_digest(live["policy"]) != policy_digest(policy):
+        raise Refuse("policy_changed", "policy on main is not the policy this decision was evaluated under")
+    base = f"https://api.github.com/repos/{inp['owner']}/{inp['repo']}"
+    try:
+        repo_doc = _api(token, base)
+        pr = _api(token, f"{base}/pulls/{inp['pr']}")
+        tip = _api(token, _branch_ref_url(base, (repo_doc or {}).get("default_branch")))
+    except Refuse:
+        raise
+    except Exception as exc:  # noqa: BLE001 - unreadable live state refuses
+        raise Refuse("premerge_unreadable", type(exc).__name__) from exc
+    if pr.get("state") != "open" or pr.get("merged"):
+        raise Refuse("pr_not_open")
+    if pr.get("draft"):
+        raise Refuse("pr_is_draft")
+    if (pr.get("head") or {}).get("sha") != inp["head_sha"]:
+        raise Refuse("stale_head", "PR head moved after the gate")
+    head_repo = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+    if not head_repo or head_repo != ((pr.get("base") or {}).get("repo") or {}).get("full_name"):
+        raise Refuse("fork_or_unknown_head_repo")
+    if (pr.get("base") or {}).get("ref") != repo_doc.get("default_branch"):
+        raise Refuse("base_not_default_branch", "PR was retargeted after the gate")
+    if ((tip or {}).get("object") or {}).get("sha") != inp["base_sha"]:
+        raise Refuse("stale_base", "the default branch moved after the gate")
+    check_grant_window(inp, policy, clock())  # again, after every live read (Codex P1, 0b75a85)
+    return {"premerge": "ok", "policy_sha256": policy_digest(policy), "head_sha": inp["head_sha"], "base_sha": inp["base_sha"],
+            "policy_version": policy_version(policy), "decision_sha256": digest}
 
 
 # ---- evidence collection (read-only token) -----------------------------------------------
@@ -168,14 +429,30 @@ def _paged(token: str, url: str, key: str | None = None, cap: int = 2000) -> lis
     raise Refuse("evidence_too_large", url)
 
 
-def collect(token: str, owner: str, repo: str, pr: int, sha: str) -> dict[str, Any]:
+def _branch_ref_url(base: str, branch: Any) -> str:
+    if not isinstance(branch, str) or not branch:
+        raise Refuse("base_evidence_unreadable", "default branch")
+    return f"{base}/git/ref/heads/{urllib.parse.quote(branch, safe='/')}"
+
+
+def collect(token: str, owner: str, repo: str, pr: int, sha: str, adr: dict | None = None,
+            base_sha: str = "") -> dict[str, Any]:
     base = f"https://api.github.com/repos/{owner}/{repo}"
     threads_query = {
         "query": """query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){
           pullRequest(number:$n){reviewThreads(first:100){totalCount nodes{isResolved isOutdated}}}}}""",
         "variables": {"o": owner, "r": repo, "n": pr}}
+    ev: dict[str, Any] = {}
+    if adr is not None:  # read live from the default branch; never from the PR
+        doc = _api(token, f"https://api.github.com/repos/{adr['repository']}/contents/{adr['path']}?ref=main")
+        ev["governing_adr"] = base64.b64decode(doc["content"]).decode("utf-8")
+    repo_doc = _api(token, base)
+    branch = (repo_doc or {}).get("default_branch")
     return {
-        "repo": _api(token, base),
+        **ev,
+        "repo": repo_doc,
+        "base_branch": _api(token, _branch_ref_url(base, branch)),
+        "compare": _api(token, f"{base}/compare/{base_sha}...{sha}") if SHA_RE.fullmatch(base_sha or "") else None,
         "pr": _api(token, f"{base}/pulls/{pr}"),
         "files": _paged(token, f"{base}/pulls/{pr}/files"),
         "check_runs": _paged(token, f"{base}/commits/{sha}/check-runs", key="check_runs"),
@@ -205,6 +482,25 @@ def _check_pr(ev: dict, inp: dict) -> None:
         raise Refuse("base_not_default_branch")
     if pr.get("mergeable") is False:
         raise Refuse("not_mergeable")
+    author = (pr.get("user") or {}).get("login")
+    if not isinstance(author, str) or not author:
+        raise Refuse("pr_author_unreadable")
+    if author.lower() == MERGE_BOT.lower():
+        raise Refuse("pr_authored_by_merge_identity", "the merge App never merges its own PR")
+
+
+def _check_base(ev: dict, inp: dict) -> None:
+    """ADR-0014 section 5 / E5: the decision is bound to the default-branch tip, and the head must
+    contain it, so CI and reviews ran against exactly the code that will land."""
+    tip = ((ev.get("base_branch") or {}).get("object") or {}).get("sha")
+    cmp = ev.get("compare")
+    if not isinstance(tip, str) or not isinstance(cmp, dict):
+        raise Refuse("base_evidence_unreadable")
+    if tip != inp["base_sha"]:
+        raise Refuse("stale_base", "the default branch moved since the decision was signed")
+    behind = cmp.get("behind_by")
+    if type(behind) is not int or behind != 0 or cmp.get("status") not in ("ahead", "identical"):
+        raise Refuse("head_behind_base", f"status={cmp.get('status')} behind_by={behind!r}")
 
 
 def _changed_paths(ev: dict) -> list[str]:
@@ -277,13 +573,25 @@ def _check_ci(ev: dict, inp: dict, policy: dict) -> None:
     for ctx, state in latest.items():
         if state != "success":
             raise Refuse("status_not_success", f"{ctx}={state}")
-    # Required contexts count only when produced by GitHub Actions check runs.
-    trusted = {r.get("name") for r in runs if (r.get("app") or {}).get("slug") == TRUSTED_CHECK_APP}
+    # ADR-0014 E3: the complete configured set must pass, never "any one green check". Required
+    # contexts count only as GitHub Actions check runs, and only with conclusion exactly success.
+    rc = policy.get("required_contexts")
+    if not isinstance(rc, dict):
+        raise Refuse("policy_invalid", "required_contexts")
     key = _canonical_repo(ev, inp)
-    required = {k.lower(): v for k, v in policy.get("required_contexts", {}).items()}
-    for ctx in required.get(key, []):
-        if ctx not in trusted:
+    contexts = {k.lower(): v for k, v in rc.items() if isinstance(k, str)}.get(key)
+    if not isinstance(contexts, list) or not contexts:
+        raise Refuse("required_contexts_not_configured", key)
+    if not all(isinstance(c, str) and c for c in contexts):
+        raise Refuse("policy_invalid", f"required_contexts[{key}]")
+    for ctx in contexts:
+        matching = [r for r in runs if r.get("name") == ctx
+                    and (r.get("app") or {}).get("slug") == TRUSTED_CHECK_APP]
+        if not matching:
             raise Refuse("required_context_missing", ctx)
+        bad = [r.get("conclusion") for r in matching if r.get("conclusion") != "success"]
+        if bad:
+            raise Refuse("required_context_not_success", f"{ctx}={bad[0]}")
 
 
 def _check_codex(ev: dict, inp: dict) -> None:
@@ -311,11 +619,66 @@ def _check_codex(ev: dict, inp: dict) -> None:
     for node in rt.get("nodes") or []:
         if not node.get("isResolved") and not node.get("isOutdated"):
             raise Refuse("unresolved_review_thread")
+    _check_codex_state(ev, sha)
 
 
-def _check_independent(ev: dict, inp: dict) -> dict:
+def _check_codex_state(ev: dict, sha: str) -> None:
+    """ADR-0014 E4: Codex's own review-state record must name this head as completed with no
+    unresolved findings. A clean receipt alone is not enough: findings from an earlier round can
+    still be open. Only the latest parseable record from the Codex App counts."""
+    state = None
+    for c in ev["issue_comments"]:
+        if (c.get("user") or {}).get("login") != CODEX_BOT:
+            continue
+        m = CODEX_STATE_RE.search(c.get("body") or "")
+        if not m:
+            continue
+        try:
+            data = json.loads(m.group(1))
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            state = data
+    if state is None:
+        raise Refuse("codex_review_state_missing")
+    code = state.get("code_review")
+    if not isinstance(code, dict):
+        raise Refuse("codex_review_state_missing", "code_review")
+    if code.get("commit_sha") != sha:
+        raise Refuse("codex_review_state_stale", str(code.get("commit_sha"))[:12])
+    if code.get("status") != "completed" or code.get("has_unresolved_findings") is not False:
+        raise Refuse("codex_unresolved_findings", "code_review")
+    sec = state.get("security_review")
+    if isinstance(sec, dict) and sec.get("commit_sha") == sha and sec.get("has_unresolved_findings") is not False:
+        raise Refuse("codex_unresolved_findings", "security_review")
+
+
+def independent_reviewers(policy: dict) -> set[str]:
+    """Allowlisted reviewer logins. The founder account (which agent sessions share today) and the
+    merge App can never be independent reviewers, so neither can manufacture this evidence."""
+    value = policy.get("independent_reviewers")
+    if not isinstance(value, list) or not all(isinstance(r, str) and r for r in value):
+        raise Refuse("policy_invalid", "independent_reviewers")
+    logins = {r.lower() for r in value}
+    if FOUNDER_LOGIN.lower() in logins or MERGE_BOT.lower() in logins:
+        raise Refuse("policy_invalid", "independent_reviewers must not include the founder or the merge App")
+    return logins
+
+
+def _is_zero(value: Any) -> bool:
+    return type(value) is int and value == 0
+
+
+def _check_independent(ev: dict, inp: dict, policy: dict) -> dict:
+    allowed = independent_reviewers(policy)
+    if not allowed:
+        raise Refuse("independent_reviewer_not_configured", "no distinct reviewer identity is allowlisted")
+    author = ((ev["pr"].get("user") or {}).get("login") or "").lower()
     found = None
     for c in ev["issue_comments"]:
+        login = ((c.get("user") or {}).get("login") or "").lower()
+        if login not in allowed or login == author:
+            continue  # not independent: unlisted, or the PR's own author
         m = INDEPENDENT_RE.search(c.get("body") or "")
         if not m:
             continue
@@ -323,16 +686,16 @@ def _check_independent(ev: dict, inp: dict) -> dict:
             data = json.loads(m.group(1))
         except ValueError:
             continue
-        if data.get("head_sha") == inp["head_sha"]:
-            found = data
+        if isinstance(data, dict) and data.get("head_sha") == inp["head_sha"]:
+            found = data  # the latest record wins, so a later FAIL overrides an earlier PASS
     if found is None:
         raise Refuse("independent_review_missing_at_head")
-    if found.get("verdict") != "PASS" or any(int(found.get(k, 1)) != 0 for k in ("critical", "high", "medium")):
+    if found.get("verdict") != "PASS" or not all(_is_zero(found.get(k)) for k in ("critical", "high", "medium")):
         raise Refuse("independent_review_not_clean")
     return found
 
 
-def verify_founder_signature(signature_b64: str, inp: dict, allowed_signers: Path) -> None:
+def verify_founder_signature(signature_b64: str, inp: dict, allowed_signers: Path, version: str) -> None:
     if not signature_b64:
         raise Refuse("founder_signature_missing")
     try:
@@ -347,24 +710,32 @@ def verify_founder_signature(signature_b64: str, inp: dict, allowed_signers: Pat
         done = subprocess.run(
             ["ssh-keygen", "-Y", "verify", "-f", str(allowed_signers), "-I", SIGNER_IDENTITY,
              "-n", SIGNATURE_NAMESPACE, "-s", str(sig)],
-            input=decision_message(inp["owner"], inp["repo"], inp["pr"], inp["head_sha"], inp["method"]),
+            input=decision_message(inp, version),
             capture_output=True, timeout=30, check=False)
     if done.returncode != 0:
         raise Refuse("founder_signature_invalid")
 
 
 def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
-             allowed_signers: Path | None = None) -> dict[str, Any]:
+             allowed_signers: Path | None = None, now: float | None = None) -> dict[str, Any]:
     _require_founder_mode(inp.get("mode"))  # again here: callers cannot bypass validate_inputs
+    _check_governing_adr(ev, policy)  # kill-switch + ADR Accepted, before any other evidence counts
+    version = policy_version(policy)
+    check_grant_window(inp, policy, now)
     _check_pr(ev, inp)
     paths = _changed_paths(ev)
     _check_gate_self(ev, inp, paths, policy)
+    _check_base(ev, inp)
     _check_ci(ev, inp, policy)
     _check_codex(ev, inp)
-    independent = _check_independent(ev, inp)
-    verify_founder_signature(signature_b64, inp, allowed_signers or Path(policy["allowed_signers"]))
-    authority = {"type": "founder_signature", "namespace": SIGNATURE_NAMESPACE}
-    return {"gate_version": GATE_VERSION, "decision": "ALLOW", **inp, "files": len(paths),
+    independent = _check_independent(ev, inp, policy)
+    verify_founder_signature(signature_b64, inp, allowed_signers or Path(policy["allowed_signers"]), version)
+    authority = {"type": "founder_signature", "namespace": SIGNATURE_NAMESPACE,
+                 "decision_version": DECISION_VERSION}
+    bound = {k: v for k, v in inp.items() if k != "expires_epoch"}
+    return {"gate_version": GATE_VERSION, "decision": "ALLOW", **bound, "policy_version": version,
+            "policy_sha256": policy_digest(policy),
+            "files": len(paths),
             "independent_review": {k: independent.get(k) for k in ("reviewer", "verdict")},
             "authority": authority}
 
@@ -372,7 +743,7 @@ def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
 def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="merge_gate.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("validate", "collect", "evaluate"):
+    for name in ("validate", "collect", "evaluate", "recheck", "premerge"):
         p = sub.add_parser(name)
         p.add_argument("--evidence", default="evidence.json")
         p.add_argument("--policy", default="policy/merge-policy.json")
@@ -382,15 +753,32 @@ def _main(argv: list[str] | None = None) -> int:
     try:
         assert_trusted_modules()
         inp = validate_inputs(env.get("IN_OWNER", ""), env.get("IN_REPO", ""), env.get("IN_PR", ""),
-                              env.get("IN_SHA", ""), env.get("IN_MODE", ""), env.get("IN_METHOD", ""))
+                              env.get("IN_SHA", ""), env.get("IN_MODE", ""), env.get("IN_METHOD", ""),
+                              env.get("IN_BASE_SHA", ""), env.get("IN_EXPIRES_AT", ""))
+        policy = json.loads(Path(args.policy).read_text())
+        adr = require_activation(policy, env.get("IN_ACTIVATION", ""), inp["owner"])
+        policy_version(policy)
+        check_grant_window(inp, policy)  # an expired or over-long grant never gets a token
         if args.cmd == "validate":
-            print(json.dumps({"valid": True, **inp}))
+            print(json.dumps({"valid": True, **inp, "adr_repo": adr["repository"].partition("/")[2]}))
+            return 0
+        if args.cmd == "recheck":
+            out = recheck_activation(env["GATE_READ_TOKEN"], env.get("GATE_REPO", ""),
+                                     env.get("IN_ACTIVATION", ""), inp["owner"])
+            out.pop("policy", None)
+            print(json.dumps(out))
+            return 0
+        if args.cmd == "premerge":
+            print(json.dumps(premerge(env["GATE_READ_TOKEN"], inp, policy, env.get("GATE_REPO", ""),
+                                      env.get("IN_ACTIVATION", ""), env.get("IN_DECISION_SHA256", ""),
+                                      workflow_token=env.get("WORKFLOW_STATE_TOKEN", ""),
+                                      run_id=env.get("GITHUB_RUN_ID", ""))))
             return 0
         if args.cmd == "collect":
-            ev = collect(env["GATE_READ_TOKEN"], inp["owner"], inp["repo"], inp["pr"], inp["head_sha"])
+            ev = collect(env["GATE_READ_TOKEN"], inp["owner"], inp["repo"], inp["pr"], inp["head_sha"], adr,
+                         inp["base_sha"])
             Path(args.evidence).write_text(json.dumps(ev))
             return 0
-        policy = json.loads(Path(args.policy).read_text())
         ev = json.loads(Path(args.evidence).read_text())
         decision = evaluate(ev, inp, policy, signature_b64=env.get("IN_SIGNATURE", ""))
     except Refuse as r:
