@@ -1,8 +1,10 @@
 # faraday-ci-bot gated merge (FARADAY-CI-BOT-HARDENING-001).
 #
 # Founder-dispatched only. Refuses unless scripts/merge_gate.py ALLOWs the exact
-# head SHA: current CI at that head, a clean Codex receipt at that head, independent
-# review evidence at that head, and a founder SSH signature over the exact decision.
+# head SHA: the complete required check set at that head, a clean Codex receipt and
+# review state at that head, independent review evidence at that head from a
+# distinct allowlisted reviewer, and an unexpired founder SSH signature over the
+# exact decision (repository, PR, head SHA, base SHA, method, policy version, expiry).
 # Policy mode (Faraday Review A0/A1) is disabled: the gate refuses any other mode.
 #
 # Token safety:
@@ -41,6 +43,14 @@ on:
         description: "Exact 40-hex head SHA being merged"
         required: true
         type: string
+      base_sha:
+        description: "Exact 40-hex default-branch tip the decision is bound to"
+        required: true
+        type: string
+      expires_at:
+        description: "Decision expiry, UTC YYYY-MM-DDTHH:MM:SSZ (at most policy grant.max_ttl_hours ahead)"
+        required: true
+        type: string
       mode:
         description: "founder only (a signed founder decision is the sole authority)"
         required: true
@@ -54,14 +64,14 @@ on:
         type: choice
         options: [squash, merge, rebase]
       founder_signature:
-        description: "base64 of the armored founder SSH signature (namespace faraday-merge-go)"
+        description: "base64 of the armored founder SSH signature over the v2 decision (namespace faraday-merge-go)"
         required: true
         type: string
 
 permissions: {}
 
 concurrency:
-  group: faraday-merge-${{ inputs.owner }}-${{ inputs.pr_number }}
+  group: faraday-merge-${{ inputs.owner }}-${{ inputs.repo }}-${{ inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
@@ -81,11 +91,14 @@ jobs:
     outputs:
       repo_name: ${{ steps.validate.outputs.repo_name }}
       adr_repo: ${{ steps.validate.outputs.adr_repo }}
+      decision_sha256: ${{ steps.evaluate.outputs.decision_sha256 }}
     env:
       IN_OWNER: ${{ inputs.owner }}
       IN_REPO: ${{ inputs.repo }}
       IN_PR: ${{ inputs.pr_number }}
       IN_SHA: ${{ inputs.head_sha }}
+      IN_BASE_SHA: ${{ inputs.base_sha }}
+      IN_EXPIRES_AT: ${{ inputs.expires_at }}
       IN_MODE: ${{ inputs.mode }}
       IN_METHOD: ${{ inputs.merge_method }}
       IN_ACTIVATION: ${{ vars.FARADAY_BOT_MERGE_ENABLED }}
@@ -120,10 +133,12 @@ jobs:
         run: python3 -I scripts/merge_gate.py collect --evidence evidence.json
 
       - name: Evaluate merge gate
+        id: evaluate
         env:
           IN_SIGNATURE: ${{ inputs.founder_signature }}
         run: |
           python3 -I scripts/merge_gate.py evaluate --evidence evidence.json --decision decision.json
+          echo "decision_sha256=$(sha256sum decision.json | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           {
             echo "### faraday-ci-bot merge gate: ALLOW"
             echo '```json'
@@ -153,6 +168,9 @@ jobs:
       IN_REPO_NAME: ${{ needs.gate.outputs.repo_name }}
       IN_PR: ${{ inputs.pr_number }}
       IN_SHA: ${{ inputs.head_sha }}
+      IN_BASE_SHA: ${{ inputs.base_sha }}
+      IN_EXPIRES_AT: ${{ inputs.expires_at }}
+      IN_DECISION_SHA256: ${{ needs.gate.outputs.decision_sha256 }}
       IN_METHOD: ${{ inputs.merge_method }}
       IN_MODE: ${{ inputs.mode }}
       IN_REPO: ${{ inputs.repo }}
@@ -163,20 +181,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Mint read-only token for the live activation re-check
+      - name: Mint read-only token for the live pre-merge re-check
         id: recheck-token
         uses: actions/create-github-app-token@67018539274d69449ef7c02e8e71183d1719ab42 # v2.1.4
         with:
           app-id: ${{ secrets.FARADAY_APP_ID }}
           private-key: ${{ secrets.FARADAY_APP_PRIVATE_KEY }}
           owner: ${{ inputs.owner }}
-          repositories: ${{ github.event.repository.name }},${{ needs.gate.outputs.adr_repo }}
+          repositories: ${{ github.event.repository.name }},${{ needs.gate.outputs.adr_repo }},${{ needs.gate.outputs.repo_name }}
           permission-contents: read
+          permission-pull-requests: read
 
-      - name: Re-check activation live (policy + ADR on main) before any write token
+      - name: Re-check live (kill switch, policy version, expiry, PR head/base) before any write token
         env:
           GATE_READ_TOKEN: ${{ steps.recheck-token.outputs.token }}
-        run: python3 -I scripts/merge_gate.py recheck
+        run: python3 -I scripts/merge_gate.py premerge
 
       - name: Mint merge token for the target repository only
         id: write-token
@@ -195,22 +214,15 @@ jobs:
           RECHECK_TOKEN: ${{ steps.recheck-token.outputs.token }}
         run: |
           set -euo pipefail
-          # Kill switch re-read live immediately before merging (policy + ADR on main).
-          GATE_READ_TOKEN="${RECHECK_TOKEN}" python3 -I scripts/merge_gate.py recheck
-          # Re-read immediately before merging: head and base must still be the gated ones.
-          now=$(gh api "repos/${IN_OWNER}/${IN_REPO_NAME}/pulls/${IN_PR}" \
-            --jq '[.head.sha, .base.ref, .base.repo.default_branch, .draft, .state] | @tsv')
-          IFS=$'\t' read -r now_sha now_base default_branch now_draft now_state <<< "${now}"
-          if [ "${now_sha}" != "${IN_SHA}" ] || [ "${now_base}" != "${default_branch}" ] \
-             || [ "${now_draft}" != "false" ] || [ "${now_state}" != "open" ]; then
-            echo "REFUSE: PR changed after the gate (head/base/draft/state)" >&2
-            exit 3
-          fi
+          # Immediately before merging, re-read live: kill switch (policy + ADR on main), policy
+          # version, grant expiry, PR open/non-draft/same head/same-repo, base == default branch,
+          # and default-branch tip == the signed base SHA. Any change refuses (exit 3).
+          GATE_READ_TOKEN="${RECHECK_TOKEN}" python3 -I scripts/merge_gate.py premerge
           title="faraday-ci-bot merge (gate v1, mode=${IN_MODE}, run=${GITHUB_RUN_ID})"
           gh api -X PUT "repos/${IN_OWNER}/${IN_REPO_NAME}/pulls/${IN_PR}/merge" \
             -f sha="${IN_SHA}" -f merge_method="${IN_METHOD}" \
             -f commit_title="${title}" \
-            -f commit_message="faraday-merge-gate:v1 head=${IN_SHA} mode=${IN_MODE} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f commit_message="faraday-merge-gate:v1 head=${IN_SHA} base=${IN_BASE_SHA} expires=${IN_EXPIRES_AT} decision_sha256=${IN_DECISION_SHA256} gate_commit=${GITHUB_SHA} mode=${IN_MODE} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             > merge.json
           echo "### merged ${IN_OWNER}/${IN_REPO_NAME}#${IN_PR} at ${IN_SHA}" >> "$GITHUB_STEP_SUMMARY"
           cat merge.json >> "$GITHUB_STEP_SUMMARY"
