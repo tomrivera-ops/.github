@@ -1214,10 +1214,11 @@ class _PremergeHarness:
             if f"/repos/tomrivera-ops/.github/actions/workflows/{run_wf}/runs?" in url:
                 if runs_error:
                     raise OSError("runs listing unavailable")
-                # Emulate GitHub's created>= filter, so the lookback window itself is under test.
-                since = urllib.parse.unquote(url.split("created=", 1)[1].split("&", 1)[0])
-                self.assertTrue(since.startswith(">="), since)
-                listed = [r for r in (own, *runs) if r["created_at"] >= since[2:]]
+                # Emulate GitHub's created>= filter if one is ever sent, so a lookback window is under test.
+                listed = [own, *runs]
+                if "created=" in url:
+                    since = urllib.parse.unquote(url.split("created=", 1)[1].split("&", 1)[0])
+                    listed = [r for r in listed if r["created_at"] >= since.lstrip("<>=")]
                 return {"total_count": len(listed), "workflow_runs": listed}
             if url.endswith(f"/repos/tomrivera-ops/.github/actions/workflows/{run_wf}"):
                 return {"id": run_wf, "state": wf_state}
@@ -1441,6 +1442,12 @@ class SingleUse005(_PremergeHarness, unittest.TestCase):
         for age_h in (1, ttl, 2 * ttl):
             self.refuse("request_id_consumed", runs=[wf_run(4100, created=iso(time.time() - age_h * 3600))])
 
+    def test_refused_early_dispatch_still_consumes_its_request_id(self):
+        """Codex P2 (0e36ef5): a decision dispatched 50h before its expiry entered the TTL window was
+        refused then (grant_ttl_exceeds_policy); replaying it later must still refuse."""
+        for age_h in (50, 24 * 30, 24 * 365):
+            self.refuse("request_id_consumed", runs=[wf_run(4100, created=iso(time.time() - age_h * 3600))])
+
     def test_earliest_dispatch_holds_the_record(self):
         """Deterministic: only the lowest run id may proceed; a later replay never blocks it."""
         out, _ = self.premerge(runs=[wf_run(4300), wf_run(4301, rid=RID2)])
@@ -1484,7 +1491,15 @@ class SingleUse005(_PremergeHarness, unittest.TestCase):
         self.assertTrue(listing)
         for url in listing:
             self.assertIn("event=workflow_dispatch", url)
-            self.assertIn("created=%3E%3D", url)
+            self.assertNotIn("created=", url)  # the whole history: consumption never ages out
+
+    def test_history_beyond_the_pagination_cap_refuses(self):
+        orig = mg._paged
+        mg._paged = lambda *a, **k: (_ for _ in ()).throw(mg.Refuse("evidence_too_large", "runs"))
+        try:
+            self.refuse("evidence_too_large")
+        finally:
+            mg._paged = orig
 
 
 class WorkflowStatic005(unittest.TestCase):

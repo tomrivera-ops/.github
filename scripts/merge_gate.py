@@ -423,8 +423,9 @@ def check_single_use(token: str, gate_repo: str, run_id: str, run_attempt: str, 
         request_id_consumed, whatever its target or outcome (consumed at the first attempt);
       * any other lower-id dispatch for the same repository, PR and head whose expiry has not passed
         refuses conflicting_decision.
-    The lookback covers every run that could still hold a live grant: each run that passes must be
-    younger than max_ttl_hours + 1h, so two runs that can both pass are at most 2*ttl + 1h apart.
+    The whole dispatch history of this workflow is read (no time filter): a dispatch made long before
+    its grant came within the TTL window, and refused then, still consumed its request_id (Codex P2,
+    0e36ef5). More than the pagination cap refuses (evidence_too_large), never allows.
     Limits: a run deleted by an admin (actions:write) is no longer seen; see docs/MERGE-GATE.md.
     """
     _require_bound_scope(inp)
@@ -455,9 +456,7 @@ def check_single_use(token: str, gate_repo: str, run_id: str, run_attempt: str, 
         raise Refuse("consumption_record_mismatch", "this run's record does not name this decision")
     if created is None or not now - (ttl + 1) * 3600 <= created <= now + 300:
         raise Refuse("consumption_record_mismatch", "run created outside the grant window")
-    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - (2 * ttl + 1) * 3600 - 300))
-    url = (f"https://api.github.com/repos/{gate_repo}/actions/workflows/{own['workflow_id']}/runs"
-           f"?event=workflow_dispatch&created={urllib.parse.quote('>=' + since, safe='')}")
+    url = f"https://api.github.com/repos/{gate_repo}/actions/workflows/{own['workflow_id']}/runs?event=workflow_dispatch"
     try:
         runs = _paged(token, url, key="workflow_runs")
     except Refuse:

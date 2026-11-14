@@ -67,7 +67,7 @@ ADR-0014 §5 requires the verifier to record a `request_id` as consumed at the f
 - `conflicting_decision`: an earlier dispatch names the same repository, PR and head with another `request_id` whose `expires_at` has not passed. So two valid decisions for one PR and head are never both usable;
 - `consumption_record_unreadable`: the run or the listing cannot be read.
 
-The earliest dispatch holds the record, so the outcome is deterministic: a later replay or conflicting dispatch refuses and never blocks the earlier one. The listing covers `2 × grant.max_ttl_hours` + 1h, which holds every dispatch that could still pass the grant window. Run-names that do not parse are ignored, because no decision can use such a run (its own check would refuse).
+The earliest dispatch holds the record, so the outcome is deterministic: a later replay or conflicting dispatch refuses and never blocks the earlier one. The gate reads this workflow's **whole** dispatch history, with no time filter, so a `request_id` never ages out. This covers a decision first dispatched (and refused) before its expiry came within the TTL window. If the history exceeds the pagination cap (2000 runs), the gate refuses `evidence_too_large`. Run-names that do not parse are ignored, because no decision can use such a run (its own check would refuse).
 
 **Why this record.** It needs no new credential or permission: the merge App keeps its current permissions, and no token gains a write scope. The alternatives were rejected:
 - A PR comment by the merge App needs `issues: write` on every target repository.
