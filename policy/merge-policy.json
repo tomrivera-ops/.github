@@ -16,7 +16,8 @@
     "governing_adr": {
       "repository": "tomrivera-ops/agent-contracts",
       "path": "decisions/ADR-0014-risk-tiered-delegated-merge.md",
-      "required_status": "Accepted"
+      "required_status": "Accepted",
+      "blob_sha": ""
     }
   }
 }

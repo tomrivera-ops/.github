@@ -41,7 +41,12 @@ Activation kill-switch (ADR-0012 section 1 forbids bot merges today): every
 subcommand refuses ``bot_merge_not_activated`` unless BOTH the policy flag
 ``activation.enabled`` is true AND the repository variable
 FARADAY_BOT_MERGE_ENABLED is exactly "true"; evaluate additionally refuses unless
-the governing ADR named in the policy is read live and its Status is Accepted.
+the governing ADR named in the policy is read live, its Status is Accepted, and its
+git blob SHA equals the pin ``activation.governing_adr.blob_sha`` (the ADR's repository
+is private on GitHub Free and cannot be protected, so its text alone is not trusted).
+premerge also refuses unless this workflow is still enabled (read live by run id), the
+live policy is byte-for-byte (canonically) the evaluated one, and the grant is unexpired
+after every live read.
 
 Run only as ``python3 -I scripts/merge_gate.py``. Without isolated mode the script
 directory is sys.path[0] and a repository file such as scripts/json.py would shadow
@@ -222,6 +227,16 @@ def check_grant_window(inp: dict, policy: dict, now: float | None = None) -> Non
 # ---- activation kill-switch ------------------------------------------------------------
 
 
+def git_blob_sha(data: bytes) -> str:
+    """Git's blob object id for ``data`` (what ``git hash-object`` prints)."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()  # noqa: S324 - git object id
+
+
+def policy_digest(policy: dict) -> str:
+    """Canonical digest of the whole policy: key order and whitespace never count, content always does."""
+    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def governing_adr(policy: dict) -> dict:
     """The policy half of the kill-switch: refuse unless activation.enabled is literally true."""
     act = policy.get("activation")
@@ -231,6 +246,8 @@ def governing_adr(policy: dict) -> dict:
     if not isinstance(adr, dict) or adr.get("required_status") != "Accepted" or not all(
             isinstance(adr.get(k), str) and adr.get(k) for k in ("repository", "path")):
         raise Refuse("policy_invalid", "activation.governing_adr")
+    if not isinstance(adr.get("blob_sha"), str) or not SHA_RE.fullmatch(adr["blob_sha"]):
+        raise Refuse("policy_invalid", "activation.governing_adr.blob_sha must pin the Accepted ADR")
     return adr
 
 
@@ -282,13 +299,15 @@ def adr_status(text: str) -> str:
 
 
 def _check_governing_adr(ev: dict, policy: dict) -> None:
-    governing_adr(policy)
+    adr = governing_adr(policy)
     text = ev.get("governing_adr")
     if not isinstance(text, str):
         raise Refuse("governing_adr_unreadable")
     status = adr_status(text)
     if not re.match(r"Accepted\b", status):
         raise Refuse("governing_adr_not_accepted", status[:80])
+    if git_blob_sha(text.encode("utf-8")) != adr["blob_sha"]:
+        raise Refuse("governing_adr_pin_mismatch", "the ADR on main is not the pinned Accepted text")
 
 
 def recheck_activation(token: str, gate_repo: str, variable: str, owner: str) -> dict:
@@ -314,20 +333,49 @@ def recheck_activation(token: str, gate_repo: str, variable: str, owner: str) ->
     return {"activation": "live", "adr": f"{adr['repository']}/{adr['path']}", "policy": live_policy}
 
 
-def premerge(token: str, inp: dict, policy: dict, gate_repo: str, variable: str, digest: str,
-             now: float | None = None) -> dict:
+RUN_ID_RE = re.compile(r"^[1-9][0-9]{0,19}$")
+
+
+def _workflow_active(token: str, gate_repo: str, run_id: str) -> None:
+    """Live emergency layer for an in-flight run. Repository variables are captured when a job
+    starts, and no token this workflow can mint may read them (create-github-app-token has no
+    variables permission; GITHUB_TOKEN has no variables scope). So the run re-reads its own
+    workflow's state: ``gh workflow disable`` stops a run that is already past the gate."""
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id) or not token:
+        raise Refuse("workflow_state_unreadable", "run id")
+    try:
+        run = _api(token, f"https://api.github.com/repos/{gate_repo}/actions/runs/{run_id}")
+        wf_id = (run or {}).get("workflow_id")
+        if type(wf_id) is not int:
+            raise Refuse("workflow_state_unreadable", "workflow id")
+        wf = _api(token, f"https://api.github.com/repos/{gate_repo}/actions/workflows/{wf_id}")
+    except Refuse:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise Refuse("workflow_state_unreadable", type(exc).__name__) from exc
+    if (wf or {}).get("state") != "active":
+        raise Refuse("workflow_not_active", str((wf or {}).get("state")))
+
+
+def premerge(token: str, inp: dict, policy: dict, gate_repo: str, variable: str, digest: str, *,
+             workflow_token: str = "", run_id: str = "", clock=None) -> dict:
     """Run immediately before the write token is minted and again immediately before PUT /merge.
 
     Read-only. Re-reads, live: the kill switch (policy on main + governing ADR), that the policy on
     main is still the version the decision was signed under, the grant expiry, and the PR (open,
-    not draft, same head, same-repo head, base still the default branch) and the default-branch tip.
+    not draft, same head, same-repo head, base still the default branch), the default-branch tip and
+    this workflow's enabled state. The expiry is checked first and again after every live read.
     """
+    clock = clock or time.time
     if not DIGEST_RE.fullmatch(digest or ""):
         raise Refuse("decision_digest_invalid")
+    check_grant_window(inp, policy, clock())
+    if not REPO_FULL_RE.fullmatch(gate_repo or ""):
+        raise Refuse("policy_invalid", "gate repository")
+    _workflow_active(workflow_token, gate_repo, run_id)
     live = recheck_activation(token, gate_repo, variable, inp["owner"])
-    if policy_version(live["policy"]) != policy_version(policy):
-        raise Refuse("policy_changed", "policy on main is not the version the decision was signed under")
-    check_grant_window(inp, live["policy"], now)
+    if policy_version(live["policy"]) != policy_version(policy) or policy_digest(live["policy"]) != policy_digest(policy):
+        raise Refuse("policy_changed", "policy on main is not the policy this decision was evaluated under")
     base = f"https://api.github.com/repos/{inp['owner']}/{inp['repo']}"
     try:
         repo_doc = _api(token, base)
@@ -350,7 +398,8 @@ def premerge(token: str, inp: dict, policy: dict, gate_repo: str, variable: str,
         raise Refuse("base_not_default_branch", "PR was retargeted after the gate")
     if ((tip or {}).get("object") or {}).get("sha") != inp["base_sha"]:
         raise Refuse("stale_base", "the default branch moved after the gate")
-    return {"premerge": "ok", "head_sha": inp["head_sha"], "base_sha": inp["base_sha"],
+    check_grant_window(inp, policy, clock())  # again, after every live read (Codex P1, 0b75a85)
+    return {"premerge": "ok", "policy_sha256": policy_digest(policy), "head_sha": inp["head_sha"], "base_sha": inp["base_sha"],
             "policy_version": policy_version(policy), "decision_sha256": digest}
 
 
@@ -685,6 +734,7 @@ def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
                  "decision_version": DECISION_VERSION}
     bound = {k: v for k, v in inp.items() if k != "expires_epoch"}
     return {"gate_version": GATE_VERSION, "decision": "ALLOW", **bound, "policy_version": version,
+            "policy_sha256": policy_digest(policy),
             "files": len(paths),
             "independent_review": {k: independent.get(k) for k in ("reviewer", "verdict")},
             "authority": authority}
@@ -720,7 +770,9 @@ def _main(argv: list[str] | None = None) -> int:
             return 0
         if args.cmd == "premerge":
             print(json.dumps(premerge(env["GATE_READ_TOKEN"], inp, policy, env.get("GATE_REPO", ""),
-                                      env.get("IN_ACTIVATION", ""), env.get("IN_DECISION_SHA256", ""))))
+                                      env.get("IN_ACTIVATION", ""), env.get("IN_DECISION_SHA256", ""),
+                                      workflow_token=env.get("WORKFLOW_STATE_TOKEN", ""),
+                                      run_id=env.get("GITHUB_RUN_ID", ""))))
             return 0
         if args.cmd == "collect":
             ev = collect(env["GATE_READ_TOKEN"], inp["owner"], inp["repo"], inp["pr"], inp["head_sha"], adr,

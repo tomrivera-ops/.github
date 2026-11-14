@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -46,6 +47,14 @@ POLICY = copy.deepcopy(SHIPPED_POLICY)
 POLICY["activation"]["enabled"] = True
 POLICY["independent_reviewers"] = [REVIEWER]
 ACCEPTED_ADR = "# ADR-0014: risk-tiered merge authority\n\n## Status\nAccepted (2026-12-01)\n\n## Decision\n...\n"
+
+
+def git_blob_sha(text: str) -> str:
+    data = text.encode("utf-8")
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+
+POLICY["activation"]["governing_adr"]["blob_sha"] = git_blob_sha(ACCEPTED_ADR)
 
 
 def iso(ts: float) -> str:
@@ -997,6 +1006,7 @@ class Hardening004(unittest.TestCase):
     def test_shipped_policy_has_no_independent_reviewer_so_it_refuses(self):
         policy = copy.deepcopy(SHIPPED_POLICY)
         policy["activation"]["enabled"] = True
+        policy["activation"]["governing_adr"]["blob_sha"] = git_blob_sha(ACCEPTED_ADR)
         self.assertEqual(SHIPPED_POLICY["independent_reviewers"], [])
         self.refuse("independent_reviewer_not_configured", policy=policy)
 
@@ -1122,10 +1132,47 @@ class Hardening004(unittest.TestCase):
         self.assertEqual(out["policy_version"], POLICY["policy_version"])
 
 
+class AdrPin(unittest.TestCase):
+    """agent-contracts is private on GitHub Free: its main cannot be protected (403), and several
+    Apps hold contents:write there. The Accepted ADR is therefore pinned by git blob SHA in the
+    policy (which lives in the protectable gate repository); any other ADR content refuses."""
+
+    def test_any_other_accepted_text_refuses(self):
+        forged = ACCEPTED_ADR.replace("## Decision\n...", "## Decision\nBots may merge anything.")
+        with self.assertRaises(mg.Refuse) as cm:
+            mg._check_governing_adr({"governing_adr": forged}, POLICY)
+        self.assertEqual(cm.exception.code, "governing_adr_pin_mismatch")
+
+    def test_pin_is_required_once_activated(self):
+        for value in (None, "", "abc", git_blob_sha(ACCEPTED_ADR).upper(), 7):
+            policy = copy.deepcopy(POLICY)
+            if value is None:
+                del policy["activation"]["governing_adr"]["blob_sha"]
+            else:
+                policy["activation"]["governing_adr"]["blob_sha"] = value
+            with self.assertRaises(mg.Refuse, msg=repr(value)) as cm:
+                mg.require_activation(policy, "true", "tomrivera-ops")
+            self.assertEqual(cm.exception.code, "policy_invalid", repr(value))
+
+    def test_pin_is_the_git_blob_sha(self):
+        self.assertEqual(mg.git_blob_sha(b"hello\n"), "ce013625030ba8dba906f756967f9e9ca394464a")
+
+    def test_shipped_policy_is_unpinned_and_inactive(self):
+        self.assertEqual(SHIPPED_POLICY["activation"]["governing_adr"].get("blob_sha"), "")
+        with self.assertRaises(mg.Refuse) as cm:
+            mg.require_activation(SHIPPED_POLICY, "true", "tomrivera-ops")
+        self.assertEqual(cm.exception.code, "bot_merge_not_activated")
+
+    def test_live_recheck_refuses_an_edited_adr(self):
+        with self.assertRaises(mg.Refuse) as cm:
+            PreMerge().premerge(adr=ACCEPTED_ADR + "\n")
+        self.assertEqual(cm.exception.code, "governing_adr_pin_mismatch")
+
+
 class PreMerge(unittest.TestCase):
     """The last check before PUT /merge re-reads everything the decision is bound to, live."""
 
-    def fake(self, pr=None, tip=BASE, live_policy=None, adr=ACCEPTED_ADR):
+    def fake(self, pr=None, tip=BASE, live_policy=None, adr=ACCEPTED_ADR, wf_state="active", run_wf=307201282):
         pr = pr if pr is not None else copy.deepcopy(evidence()["pr"])
         live_policy = live_policy if live_policy is not None else POLICY
         calls = []
@@ -1144,15 +1191,20 @@ class PreMerge(unittest.TestCase):
                 return pr
             if url.endswith("/repos/tomrivera-ops/ecosystem-audit/git/ref/heads/main"):
                 return {"ref": "refs/heads/main", "object": {"sha": tip}}
+            if url.endswith("/repos/tomrivera-ops/.github/actions/runs/4242"):
+                return {"id": 4242, "workflow_id": run_wf}
+            if url.endswith(f"/repos/tomrivera-ops/.github/actions/workflows/{run_wf}"):
+                return {"id": run_wf, "state": wf_state}
             raise AssertionError(url)
         return fake_api, calls
 
-    def premerge(self, inp=None, now=None, digest="0" * 64, **kw):
+    def premerge(self, inp=None, clock=None, digest="0" * 64, policy=None, run_id="4242", **kw):
         fake_api, calls = self.fake(**kw)
         orig = mg._api
         mg._api = fake_api
         try:
-            return mg.premerge("t", inp or inputs(), POLICY, "tomrivera-ops/.github", "true", digest, now=now), calls
+            return mg.premerge("t", inp or inputs(), policy or POLICY, "tomrivera-ops/.github", "true", digest,
+                               workflow_token="w", run_id=run_id, clock=clock), calls
         finally:
             mg._api = orig
 
@@ -1200,7 +1252,38 @@ class PreMerge(unittest.TestCase):
 
     def test_grant_expired_between_gate_and_merge(self):
         inp = inputs()
-        self.refuse("grant_expired", inp=inp, now=inp["expires_epoch"] + 1)
+        self.refuse("grant_expired", inp=inp, clock=lambda: inp["expires_epoch"] + 1)
+
+    def test_grant_expiring_during_the_live_reads_refuses(self):
+        """Codex P1 (0b75a85): expiry is checked again after every live read, right before success."""
+        inp = inputs()
+        times = iter([inp["expires_epoch"] - 5])
+        self.refuse("grant_expired", inp=inp, clock=lambda: next(times, inp["expires_epoch"] + 1))
+
+    def test_workflow_disabled_while_running_refuses(self):
+        """Codex P1 (0b75a85): the repository variable cannot be re-read with any token this workflow can
+        mint, so the live emergency layer is this workflow's own state, read via the run id."""
+        for state in ("disabled_manually", "disabled_inactivity", "deleted", None):
+            self.refuse("workflow_not_active", wf_state=state)
+
+    def test_workflow_state_unreadable_or_run_id_invalid_refuses(self):
+        for run_id in ("", "abc", "12 34", "0x1", "4242\n"):
+            self.refuse("workflow_state_unreadable", run_id=run_id)
+        self.refuse("workflow_state_unreadable", run_wf="307201282")  # non-integer workflow_id
+
+    def test_policy_content_changed_without_version_bump_refuses(self):
+        """Codex P2 (0b75a85): any change to the live policy invalidates the in-flight decision."""
+        live = copy.deepcopy(POLICY)
+        live["independent_reviewers"] = []
+        self.refuse("policy_changed", live_policy=live)
+        live = copy.deepcopy(POLICY)
+        live["required_contexts"]["tomrivera-ops/ecosystem-audit"].append("faraday-review")
+        self.refuse("policy_changed", live_policy=live)
+
+    def test_policy_key_order_alone_is_not_a_change(self):
+        live = dict(reversed(list(copy.deepcopy(POLICY).items())))
+        out, _ = self.premerge(live_policy=live)
+        self.assertEqual(out["premerge"], "ok")
 
     def test_decision_digest_must_be_hex64(self):
         for bad in ("", "x" * 64, "0" * 63, ("0" * 64) + "\n", "0" * 64 + " run=evil"):
@@ -1231,6 +1314,13 @@ class WorkflowStatic004(unittest.TestCase):
 
     def test_concurrency_is_per_repository_and_pr(self):
         self.assertIn("group: faraday-merge-${{ inputs.owner }}-${{ inputs.repo }}-${{ inputs.pr_number }}", self.wf)
+
+    def test_merge_job_reads_its_own_workflow_state_with_actions_read_only(self):
+        merge = self.wf.split("\n  merge:\n", 1)[1]
+        head = merge.split("    steps:", 1)[0]
+        self.assertIn("permissions:\n      actions: read\n", head)
+        self.assertNotIn(": write", head)
+        self.assertEqual(merge.count("WORKFLOW_STATE_TOKEN: ${{ github.token }}"), 2)
 
     def test_premerge_token_is_read_only(self):
         merge = self.wf.split("\n  merge:\n", 1)[1]

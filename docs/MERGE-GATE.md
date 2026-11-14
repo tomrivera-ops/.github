@@ -70,16 +70,26 @@ ADR-0012 §1 forbids any bot merge. This workflow therefore ships **inactive** a
 ratified ADR-0014 supersedes ADR-0012 §1 for the scope it names. A merge needs all three, independently:
 1. Repository variable `FARADAY_BOT_MERGE_ENABLED` is exactly `true`. Otherwise both jobs are skipped and no token is minted.
 2. `policy/merge-policy.json` `activation.enabled` is `true`. This file can only change through a founder-merged PR, because the bot never merges `policy/`. Otherwise every subcommand refuses `bot_merge_not_activated` before any token is minted.
-3. The governing ADR named in `activation.governing_adr` is read live from `main` of its repository and its `## Status` line starts with `Accepted`. Otherwise the gate refuses `governing_adr_not_accepted` or `governing_adr_unreadable`. The shipped path is ADR-0014 (agent-contracts PR #13, Proposed, not on `main`): until it is merged AND ratified the gate refuses (`governing_adr_unreadable`, then `governing_adr_not_accepted`).
+3. The governing ADR named in `activation.governing_adr` is read live from `main` of its repository, its `## Status` line starts with `Accepted`, and its git blob SHA equals `activation.governing_adr.blob_sha`. Otherwise the gate refuses `governing_adr_not_accepted`, `governing_adr_unreadable` or `governing_adr_pin_mismatch`.
+   - The pin exists because `agent-contracts` is private on GitHub Free: its `main` cannot be protected (the API returns 403), and several installed Apps hold `contents: write` there. Its text alone is therefore not trusted.
+   - The founder sets the pin (`git hash-object decisions/ADR-0014-risk-tiered-delegated-merge.md` at the ratified commit) in the same founder-merged PR that sets `activation.enabled`. The shipped pin is empty, which refuses `policy_invalid` once enabled.
+   - Any later edit to the ADR, including a forged `Accepted`, refuses until the founder re-pins it. The shipped path is ADR-0014 (agent-contracts PR #13, Proposed, not on `main`): until it is merged AND ratified the gate refuses (`governing_adr_unreadable`, then `governing_adr_not_accepted`).
 
-   The Status is parsed strictly. HTML comments and fenced code blocks are ignored, and exactly one `## Status` section must remain; otherwise the gate refuses `governing_adr_ambiguous`. The merge job re-reads the policy file and the ADR live from `main` (`merge_gate.py recheck`) twice: before it mints the write token, and immediately before the merge call. Disabling `activation.enabled` or withdrawing the ADR therefore stops a run that the gate already allowed. The repository variable is evaluated again when the merge job starts.
+   The Status is parsed strictly. HTML comments and fenced code blocks are ignored, and exactly one `## Status` section must remain; otherwise the gate refuses `governing_adr_ambiguous`. The merge job runs `merge_gate.py premerge` twice: before it mints the write token, and immediately before the merge call. Each time it re-reads live:
+   - this workflow's own state (via the run id and `GITHUB_TOKEN` `actions: read`);
+   - the policy file and the pinned ADR from `main`;
+   - the grant expiry, before and after the reads.
+
+   It refuses `workflow_not_active` or `policy_changed` on any change to the canonical policy content, not just to `policy_version`. Disabling the workflow, disabling `activation.enabled`, editing the policy or withdrawing the ADR therefore stops a run that the gate already allowed.
+
+   The repository variable is evaluated when each job starts. It cannot be re-read mid-run, because the pinned `create-github-app-token` has no variables permission and `GITHUB_TOKEN` has no variables scope. For an in-flight run, use `gh workflow disable`.
 
 Activation never replaces the founder signature. It only permits the gate to evaluate.
 
 ## Emergency disable
 Use any one of these. Each is enough on its own:
-- `gh variable delete FARADAY_BOT_MERGE_ENABLED -R tomrivera-ops/.github`, or set it to anything except `true`.
-- `gh workflow disable "CLI Approve & Merge" -R tomrivera-ops/.github`.
+- `gh workflow disable "CLI Approve & Merge" -R tomrivera-ops/.github`. This is the only switch that also stops a run already past the gate, because `premerge` reads it live.
+- `gh variable delete FARADAY_BOT_MERGE_ENABLED -R tomrivera-ops/.github`, or set it to anything except `true`. This stops every job that has not started yet.
 - Revoke the App private key, or suspend or uninstall the `faraday-ci-bot` App installation.
 
 After an emergency disable, also set `activation.enabled` to `false` in a founder-merged PR, and record a `governance-event`.

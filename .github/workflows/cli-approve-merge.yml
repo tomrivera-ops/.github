@@ -18,7 +18,9 @@
 #     and inputs reach scripts only through environment variables;
 #   * KILL-SWITCH (default: refuse): both jobs are skipped unless repository variable
 #     FARADAY_BOT_MERGE_ENABLED == 'true', and merge_gate.py also refuses unless
-#     policy activation.enabled is true and the governing ADR (ADR-0014) is Accepted.
+#     policy activation.enabled is true and the governing ADR (ADR-0014) is Accepted
+#     and matches its pinned blob SHA. In flight, premerge re-reads the policy, the ADR
+#     and this workflow's enabled state (gh workflow disable stops a running merge);
 #     ADR-0012 section 1 forbids any bot merge until that ADR is ratified;
 #   * every Python step runs isolated (python3 -I), so repository files can never
 #     shadow the standard library; the gate refuses to run without it.
@@ -162,7 +164,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: faraday-merge
-    permissions: {}
+    # actions: read lets premerge re-read this workflow's own enabled state live (emergency disable).
+    permissions:
+      actions: read
     env:
       IN_OWNER: ${{ inputs.owner }}
       IN_REPO_NAME: ${{ needs.gate.outputs.repo_name }}
@@ -192,9 +196,10 @@ jobs:
           permission-contents: read
           permission-pull-requests: read
 
-      - name: Re-check live (kill switch, policy version, expiry, PR head/base) before any write token
+      - name: Re-check live (workflow enabled, kill switch, policy, expiry, PR head/base) before any write token
         env:
           GATE_READ_TOKEN: ${{ steps.recheck-token.outputs.token }}
+          WORKFLOW_STATE_TOKEN: ${{ github.token }}
         run: python3 -I scripts/merge_gate.py premerge
 
       - name: Mint merge token for the target repository only
@@ -212,11 +217,13 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.write-token.outputs.token }}
           RECHECK_TOKEN: ${{ steps.recheck-token.outputs.token }}
+          WORKFLOW_STATE_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Immediately before merging, re-read live: kill switch (policy + ADR on main), policy
-          # version, grant expiry, PR open/non-draft/same head/same-repo, base == default branch,
-          # and default-branch tip == the signed base SHA. Any change refuses (exit 3).
+          # Immediately before merging, re-read live: this workflow still enabled, kill switch
+          # (policy + pinned ADR on main), policy unchanged, grant expiry (before and after the
+          # reads), PR open/non-draft/same head/same-repo, base == default branch, and
+          # default-branch tip == the signed base SHA. Any change refuses (exit 3).
           GATE_READ_TOKEN="${RECHECK_TOKEN}" python3 -I scripts/merge_gate.py premerge
           title="faraday-ci-bot merge (gate v1, mode=${IN_MODE}, run=${GITHUB_RUN_ID})"
           gh api -X PUT "repos/${IN_OWNER}/${IN_REPO_NAME}/pulls/${IN_PR}/merge" \
