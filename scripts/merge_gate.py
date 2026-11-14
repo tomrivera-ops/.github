@@ -8,6 +8,7 @@ Subcommands
   validate   check workflow inputs (run before any token is minted)
   collect    read PR evidence through the GitHub API with a READ-ONLY token
   evaluate   apply the policy to collected evidence; exit 0 only on ALLOW
+  consume    single-use check of this dispatch's request_id (before any App token)
   premerge   live re-read immediately before a write token and before PUT /merge
   recheck    live re-read of the kill switch only (policy file + governing ADR)
 
@@ -29,9 +30,14 @@ A merge is allowed only when ALL of these hold for the input head SHA:
     is not the PR author (the founder account and the merge App can never be listed):
     the latest such record has verdict PASS and integer 0 critical/high/medium;
   * authorization: an SSH signature by the founder key (namespace
-    faraday-merge-go) over the exact v2 decision message, which binds repository,
-    PR, head SHA, base SHA, merge method, policy version and an expiry no further
-    ahead than the policy's grant.max_ttl_hours. That is the only authority.
+    faraday-merge-go) over the exact v3 decision message, which binds repository,
+    PR, head SHA, base SHA, merge method, scope (single-merge), policy version, an
+    expiry no further ahead than the policy's grant.max_ttl_hours, and a single-use
+    request_id. That is the only authority. v1 and v2 messages never verify;
+  * single use: the request_id is consumed by its first dispatch. The record is the
+    workflow run itself (its run-name names request_id, target and expiry); the gate
+    refuses a re-run, a request_id named by any earlier dispatch, and a second
+    unexpired decision for the same repository, PR and head (earliest dispatch wins).
     Policy mode (Faraday Review A0/A1) is disabled: a check run is not authority,
     because any workflow's GITHUB_TOKEN can create one, so every non-founder
     mode refuses (policy_mode_disabled).
@@ -90,7 +96,8 @@ GATE_VERSION = "1"
 CODEX_BOT = "chatgpt-codex-connector[bot]"
 MERGE_BOT = "faraday-ci-bot[bot]"
 FOUNDER_LOGIN = "tomrivera-PSE"
-DECISION_VERSION = "v2"
+DECISION_VERSION = "v3"  # v3 adds scope and request_id; v1 and v2 never verify
+SCOPE = "single-merge"  # ADR-0014 section 5: the single merge, with no other operation
 SIGNATURE_NAMESPACE = "faraday-merge-go"
 SIGNER_IDENTITY = "founder"
 OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
@@ -101,6 +108,11 @@ PR_RE = re.compile(r"^[1-9][0-9]{0,6}$")
 EXPIRES_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 POLICY_VERSION_RE = re.compile(r"^[1-9][0-9]{0,5}$")
+REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")  # 128 random bits, e.g. `openssl rand -hex 16`
+# The run-name every dispatch of cli-approve-merge.yml carries; GitHub sets it when the run is created.
+RUN_TITLE_RE = re.compile(r"^faraday-merge rid=(?P<rid>[0-9a-f]{32}) target=(?P<owner>[A-Za-z0-9-]{1,39})/"
+                          r"(?P<repo>(?:[A-Za-z0-9-]{1,39}/)?[A-Za-z0-9._-]{1,100})#(?P<pr>[1-9][0-9]{0,6})"
+                          r"@(?P<head>[0-9a-f]{40}) exp=(?P<exp>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)$")
 MAX_GRANT_TTL_HOURS = 168
 MODES = ("founder",)  # policy mode is disabled; see _require_founder_mode
 METHODS = ("squash", "merge", "rebase")
@@ -145,7 +157,7 @@ def assert_trusted_modules() -> None:
 
 
 def validate_inputs(owner: str, repo: str, pr: str, sha: str, mode: str, method: str,
-                    base_sha: str, expires_at: str) -> dict[str, Any]:
+                    base_sha: str, expires_at: str, request_id: str) -> dict[str, Any]:
     if not OWNER_RE.fullmatch(owner or ""):
         raise Refuse("invalid_owner")
     full = repo or ""
@@ -172,8 +184,11 @@ def validate_inputs(owner: str, repo: str, pr: str, sha: str, mode: str, method:
         expires_epoch = calendar.timegm(time.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError as exc:
         raise Refuse("invalid_expires_at", "not a real UTC time") from exc
+    if not isinstance(request_id, str) or not REQUEST_ID_RE.fullmatch(request_id):
+        raise Refuse("invalid_request_id", "32 lower-case hex characters are required")
     return {"owner": owner, "repo": name, "pr": int(pr), "head_sha": sha, "mode": mode, "method": method,
-            "base_sha": base_sha, "expires_at": expires_at, "expires_epoch": expires_epoch}
+            "base_sha": base_sha, "expires_at": expires_at, "expires_epoch": expires_epoch,
+            "scope": SCOPE, "request_id": request_id}
 
 
 def _require_founder_mode(mode: Any) -> None:
@@ -184,10 +199,12 @@ def _require_founder_mode(mode: Any) -> None:
 
 
 def decision_message(inp: dict, policy_version: str) -> bytes:
-    """The exact bytes the founder signs (ADR-0014 section 5 tuple, plus method, policy and expiry).
+    """The exact bytes the founder signs: the ADR-0014 section 5 binding (repository, action as the
+    merge method, target PR, base and head SHAs, scope, expires_at, request_id) plus the policy version.
 
     The repository is lower-cased because GitHub names are case-insensitive: the spelling used at
-    dispatch can neither break nor widen a decision.
+    dispatch can neither break nor widen a decision. The tag is v3 because the earlier v2 tag named a
+    message without scope and request_id; a v1 or v2 signature can never verify against these bytes.
     """
     repo = f"{inp['owner']}/{inp['repo']}".lower()
     return (f"faraday-merge-decision:{DECISION_VERSION}\n"
@@ -196,8 +213,19 @@ def decision_message(inp: dict, policy_version: str) -> bytes:
             f"head={inp['head_sha']}\n"
             f"base={inp['base_sha']}\n"
             f"method={inp['method']}\n"
+            f"scope={inp['scope']}\n"
             f"policy={policy_version}\n"
-            f"expires={inp['expires_at']}\n").encode()
+            f"expires={inp['expires_at']}\n"
+            f"request_id={inp['request_id']}\n").encode()
+
+
+def _require_bound_scope(inp: dict) -> None:
+    """Callers cannot bypass validate_inputs to widen the scope or drop the request_id."""
+    if inp.get("scope") != SCOPE:
+        raise Refuse("invalid_scope", "only single-merge is supported")
+    rid = inp.get("request_id")
+    if not isinstance(rid, str) or not REQUEST_ID_RE.fullmatch(rid):
+        raise Refuse("invalid_request_id")
 
 
 def policy_version(policy: dict) -> str:
@@ -357,8 +385,104 @@ def _workflow_active(token: str, gate_repo: str, run_id: str) -> None:
         raise Refuse("workflow_not_active", str((wf or {}).get("state")))
 
 
+def _epoch(stamp: Any) -> int | None:
+    if not isinstance(stamp, str) or not EXPIRES_RE.fullmatch(stamp):
+        return None
+    try:
+        return calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+def _run_record(title: Any) -> dict | None:
+    """Parse a dispatch's run-name into its single-use record; anything else is not a record."""
+    m = RUN_TITLE_RE.fullmatch(title) if isinstance(title, str) else None
+    if not m:
+        return None
+    owner, repo = m["owner"].lower(), m["repo"].lower()
+    if "/" in repo:  # the repo input may be given as owner/name
+        o, _, repo = repo.partition("/")
+        if o != owner:
+            return None
+    exp = _epoch(m["exp"])
+    if exp is None or repo in (".", ".."):
+        return None
+    return {"rid": m["rid"], "target": (owner, repo, int(m["pr"]), m["head"]), "exp": exp, "expires_at": m["exp"]}
+
+
+def check_single_use(token: str, gate_repo: str, run_id: str, run_attempt: str, inp: dict, policy: dict,
+                     now: float | None = None) -> dict:
+    """ADR-0014 section 5: a request_id is single-use, and one PR+head has at most one live decision.
+
+    The consumption record is the workflow run that GitHub creates for each dispatch, before any job
+    runs: its run-name names the request_id, the target and the expiry and cannot be edited afterwards.
+    Read with GITHUB_TOKEN actions:read on the gate repository only; no new credential exists.
+      * this run must be the first attempt (a re-run re-uses the inputs and signature) and its own
+        record must name exactly this decision;
+      * any OTHER dispatch of this workflow with a lower run id that names the same request_id refuses
+        request_id_consumed, whatever its target or outcome (consumed at the first attempt);
+      * any other lower-id dispatch for the same repository, PR and head whose expiry has not passed
+        refuses conflicting_decision.
+    The lookback covers every run that could still hold a live grant: each run that passes must be
+    younger than max_ttl_hours + 1h, so two runs that can both pass are at most 2*ttl + 1h apart.
+    Limits: a run deleted by an admin (actions:write) is no longer seen; see docs/MERGE-GATE.md.
+    """
+    _require_bound_scope(inp)
+    now = time.time() if now is None else now
+    if run_attempt != "1":
+        raise Refuse("rerun_refused", "a re-run would re-use a consumed decision")
+    if not isinstance(run_id, str) or not RUN_ID_RE.fullmatch(run_id) or not token:
+        raise Refuse("consumption_record_unreadable", "run id")
+    if not REPO_FULL_RE.fullmatch(gate_repo or ""):
+        raise Refuse("policy_invalid", "gate repository")
+    grant = policy.get("grant")
+    ttl = grant.get("max_ttl_hours") if isinstance(grant, dict) else None
+    if type(ttl) is not int or not 1 <= ttl <= MAX_GRANT_TTL_HOURS:
+        raise Refuse("policy_invalid", "grant.max_ttl_hours")
+    try:
+        own = _api(token, f"https://api.github.com/repos/{gate_repo}/actions/runs/{run_id}")
+    except Exception as exc:  # noqa: BLE001
+        raise Refuse("consumption_record_unreadable", type(exc).__name__) from exc
+    own = own if isinstance(own, dict) else {}
+    if own.get("run_attempt") != 1:
+        raise Refuse("rerun_refused", f"run_attempt={own.get('run_attempt')!r}")
+    record = _run_record(own.get("display_title"))
+    target = (inp["owner"].lower(), inp["repo"].lower(), inp["pr"], inp["head_sha"])
+    created = _epoch(own.get("created_at"))
+    if (own.get("id") != int(run_id) or own.get("event") != "workflow_dispatch" or record is None
+            or record["rid"] != inp["request_id"] or record["target"] != target
+            or record["expires_at"] != inp["expires_at"] or type(own.get("workflow_id")) is not int):
+        raise Refuse("consumption_record_mismatch", "this run's record does not name this decision")
+    if created is None or not now - (ttl + 1) * 3600 <= created <= now + 300:
+        raise Refuse("consumption_record_mismatch", "run created outside the grant window")
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - (2 * ttl + 1) * 3600 - 300))
+    url = (f"https://api.github.com/repos/{gate_repo}/actions/workflows/{own['workflow_id']}/runs"
+           f"?event=workflow_dispatch&created={urllib.parse.quote('>=' + since, safe='')}")
+    try:
+        runs = _paged(token, url, key="workflow_runs")
+    except Refuse:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise Refuse("consumption_record_unreadable", type(exc).__name__) from exc
+    me = int(run_id)
+    for r in runs:
+        rid = r.get("id") if isinstance(r, dict) else None
+        if type(rid) is not int:
+            raise Refuse("consumption_record_unreadable", "run without id")
+        if rid >= me:
+            continue  # the earliest dispatch holds the record; a later one never blocks it
+        other = _run_record(r.get("display_title"))
+        if other is None:
+            continue  # not a dispatch any decision could use (every usable run must parse; see above)
+        if other["rid"] == inp["request_id"]:
+            raise Refuse("request_id_consumed", f"already dispatched as run {rid}")
+        if other["target"] == target and other["exp"] > now:
+            raise Refuse("conflicting_decision", f"run {rid} holds an unexpired decision for this PR and head")
+    return {"single_use": "ok", "request_id": inp["request_id"], "run_id": me, "runs_checked": len(runs)}
+
+
 def premerge(token: str, inp: dict, policy: dict, gate_repo: str, variable: str, digest: str, *,
-             workflow_token: str = "", run_id: str = "", clock=None) -> dict:
+             workflow_token: str = "", run_id: str = "", run_attempt: str = "", clock=None) -> dict:
     """Run immediately before the write token is minted and again immediately before PUT /merge.
 
     Read-only. Re-reads, live: the kill switch (policy on main + governing ADR), that the policy on
@@ -373,6 +497,7 @@ def premerge(token: str, inp: dict, policy: dict, gate_repo: str, variable: str,
     if not REPO_FULL_RE.fullmatch(gate_repo or ""):
         raise Refuse("policy_invalid", "gate repository")
     _workflow_active(workflow_token, gate_repo, run_id)
+    check_single_use(workflow_token, gate_repo, run_id, run_attempt, inp, policy)
     live = recheck_activation(token, gate_repo, variable, inp["owner"])
     if policy_version(live["policy"]) != policy_version(policy) or policy_digest(live["policy"]) != policy_digest(policy):
         raise Refuse("policy_changed", "policy on main is not the policy this decision was evaluated under")
@@ -400,7 +525,8 @@ def premerge(token: str, inp: dict, policy: dict, gate_repo: str, variable: str,
         raise Refuse("stale_base", "the default branch moved after the gate")
     check_grant_window(inp, policy, clock())  # again, after every live read (Codex P1, 0b75a85)
     return {"premerge": "ok", "policy_sha256": policy_digest(policy), "head_sha": inp["head_sha"], "base_sha": inp["base_sha"],
-            "policy_version": policy_version(policy), "decision_sha256": digest}
+            "policy_version": policy_version(policy), "decision_sha256": digest,
+            "request_id": inp["request_id"], "scope": inp["scope"]}
 
 
 # ---- evidence collection (read-only token) -----------------------------------------------
@@ -719,6 +845,7 @@ def verify_founder_signature(signature_b64: str, inp: dict, allowed_signers: Pat
 def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
              allowed_signers: Path | None = None, now: float | None = None) -> dict[str, Any]:
     _require_founder_mode(inp.get("mode"))  # again here: callers cannot bypass validate_inputs
+    _require_bound_scope(inp)
     _check_governing_adr(ev, policy)  # kill-switch + ADR Accepted, before any other evidence counts
     version = policy_version(policy)
     check_grant_window(inp, policy, now)
@@ -743,7 +870,7 @@ def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
 def _main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="merge_gate.py")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("validate", "collect", "evaluate", "recheck", "premerge"):
+    for name in ("validate", "consume", "collect", "evaluate", "recheck", "premerge"):
         p = sub.add_parser(name)
         p.add_argument("--evidence", default="evidence.json")
         p.add_argument("--policy", default="policy/merge-policy.json")
@@ -754,13 +881,19 @@ def _main(argv: list[str] | None = None) -> int:
         assert_trusted_modules()
         inp = validate_inputs(env.get("IN_OWNER", ""), env.get("IN_REPO", ""), env.get("IN_PR", ""),
                               env.get("IN_SHA", ""), env.get("IN_MODE", ""), env.get("IN_METHOD", ""),
-                              env.get("IN_BASE_SHA", ""), env.get("IN_EXPIRES_AT", ""))
+                              env.get("IN_BASE_SHA", ""), env.get("IN_EXPIRES_AT", ""),
+                              env.get("IN_REQUEST_ID", ""))
         policy = json.loads(Path(args.policy).read_text())
         adr = require_activation(policy, env.get("IN_ACTIVATION", ""), inp["owner"])
         policy_version(policy)
         check_grant_window(inp, policy)  # an expired or over-long grant never gets a token
         if args.cmd == "validate":
             print(json.dumps({"valid": True, **inp, "adr_repo": adr["repository"].partition("/")[2]}))
+            return 0
+        if args.cmd == "consume":
+            print(json.dumps(check_single_use(env.get("WORKFLOW_STATE_TOKEN", ""), env.get("GATE_REPO", ""),
+                                              env.get("GITHUB_RUN_ID", ""), env.get("GITHUB_RUN_ATTEMPT", ""),
+                                              inp, policy)))
             return 0
         if args.cmd == "recheck":
             out = recheck_activation(env["GATE_READ_TOKEN"], env.get("GATE_REPO", ""),
@@ -772,7 +905,8 @@ def _main(argv: list[str] | None = None) -> int:
             print(json.dumps(premerge(env["GATE_READ_TOKEN"], inp, policy, env.get("GATE_REPO", ""),
                                       env.get("IN_ACTIVATION", ""), env.get("IN_DECISION_SHA256", ""),
                                       workflow_token=env.get("WORKFLOW_STATE_TOKEN", ""),
-                                      run_id=env.get("GITHUB_RUN_ID", ""))))
+                                      run_id=env.get("GITHUB_RUN_ID", ""),
+                                      run_attempt=env.get("GITHUB_RUN_ATTEMPT", ""))))
             return 0
         if args.cmd == "collect":
             ev = collect(env["GATE_READ_TOKEN"], inp["owner"], inp["repo"], inp["pr"], inp["head_sha"], adr,

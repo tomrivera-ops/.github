@@ -4,7 +4,10 @@
 # head SHA: the complete required check set at that head, a clean Codex receipt and
 # review state at that head, independent review evidence at that head from a
 # distinct allowlisted reviewer, and an unexpired founder SSH signature over the
-# exact decision (repository, PR, head SHA, base SHA, method, policy version, expiry).
+# exact v3 decision (repository, PR, head SHA, base SHA, method, scope, policy version,
+# expiry, single-use request_id). The run-name below is the request_id consumption
+# record: the gate refuses a re-run, a request_id named by any earlier dispatch, and a
+# second unexpired decision for the same PR and head (docs/MERGE-GATE.md).
 # Policy mode (Faraday Review A0/A1) is disabled: the gate refuses any other mode.
 #
 # Token safety:
@@ -25,6 +28,7 @@
 #   * every Python step runs isolated (python3 -I), so repository files can never
 #     shadow the standard library; the gate refuses to run without it.
 name: CLI Approve & Merge
+run-name: 'faraday-merge rid=${{ inputs.request_id }} target=${{ inputs.owner }}/${{ inputs.repo }}#${{ inputs.pr_number }}@${{ inputs.head_sha }} exp=${{ inputs.expires_at }}'
 
 on:
   workflow_dispatch:
@@ -65,8 +69,12 @@ on:
         default: squash
         type: choice
         options: [squash, merge, rebase]
+      request_id:
+        description: "Single-use decision id, 32 lower-case hex (openssl rand -hex 16); signed in the v3 decision"
+        required: true
+        type: string
       founder_signature:
-        description: "base64 of the armored founder SSH signature over the v2 decision (namespace faraday-merge-go)"
+        description: "base64 of the armored founder SSH signature over the v3 decision (namespace faraday-merge-go)"
         required: true
         type: string
 
@@ -88,8 +96,10 @@ jobs:
     # Same environment as the merge job, so the App key can live only in
     # environment secrets (deployment branch: main) and nowhere org-wide.
     environment: faraday-merge
+    # actions: read lets the gate read this workflow's run history: the request_id consumption record.
     permissions:
       contents: read
+      actions: read
     outputs:
       repo_name: ${{ steps.validate.outputs.repo_name }}
       adr_repo: ${{ steps.validate.outputs.adr_repo }}
@@ -101,6 +111,7 @@ jobs:
       IN_SHA: ${{ inputs.head_sha }}
       IN_BASE_SHA: ${{ inputs.base_sha }}
       IN_EXPIRES_AT: ${{ inputs.expires_at }}
+      IN_REQUEST_ID: ${{ inputs.request_id }}
       IN_MODE: ${{ inputs.mode }}
       IN_METHOD: ${{ inputs.merge_method }}
       IN_ACTIVATION: ${{ vars.FARADAY_BOT_MERGE_ENABLED }}
@@ -114,6 +125,12 @@ jobs:
         run: |
           python3 -I scripts/merge_gate.py validate > validated.json
           python3 -I -c "import json;v=json.load(open('validated.json'));print('repo_name='+v['repo']+'\nadr_repo='+v['adr_repo'])" >> "$GITHUB_OUTPUT"
+
+      - name: Single-use check of the request_id (this workflow's run history; before any App token)
+        env:
+          WORKFLOW_STATE_TOKEN: ${{ github.token }}
+          GATE_REPO: ${{ github.repository }}
+        run: python3 -I scripts/merge_gate.py consume
 
       - name: Mint read-only token for the target repository
         id: read-token
@@ -174,6 +191,7 @@ jobs:
       IN_SHA: ${{ inputs.head_sha }}
       IN_BASE_SHA: ${{ inputs.base_sha }}
       IN_EXPIRES_AT: ${{ inputs.expires_at }}
+      IN_REQUEST_ID: ${{ inputs.request_id }}
       IN_DECISION_SHA256: ${{ needs.gate.outputs.decision_sha256 }}
       IN_METHOD: ${{ inputs.merge_method }}
       IN_MODE: ${{ inputs.mode }}
@@ -196,7 +214,7 @@ jobs:
           permission-contents: read
           permission-pull-requests: read
 
-      - name: Re-check live (workflow enabled, kill switch, policy, expiry, PR head/base) before any write token
+      - name: Re-check live (workflow enabled, single use, kill switch, policy, expiry, PR head/base) before any write token
         env:
           GATE_READ_TOKEN: ${{ steps.recheck-token.outputs.token }}
           WORKFLOW_STATE_TOKEN: ${{ github.token }}
@@ -220,7 +238,7 @@ jobs:
           WORKFLOW_STATE_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Immediately before merging, re-read live: this workflow still enabled, kill switch
+          # Immediately before merging, re-read live: this workflow still enabled, single use, kill switch
           # (policy + pinned ADR on main), policy unchanged, grant expiry (before and after the
           # reads), PR open/non-draft/same head/same-repo, base == default branch, and
           # default-branch tip == the signed base SHA. Any change refuses (exit 3).
@@ -229,7 +247,7 @@ jobs:
           gh api -X PUT "repos/${IN_OWNER}/${IN_REPO_NAME}/pulls/${IN_PR}/merge" \
             -f sha="${IN_SHA}" -f merge_method="${IN_METHOD}" \
             -f commit_title="${title}" \
-            -f commit_message="faraday-merge-gate:v1 head=${IN_SHA} base=${IN_BASE_SHA} expires=${IN_EXPIRES_AT} decision_sha256=${IN_DECISION_SHA256} gate_commit=${GITHUB_SHA} mode=${IN_MODE} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            -f commit_message="faraday-merge-gate:v2 head=${IN_SHA} base=${IN_BASE_SHA} expires=${IN_EXPIRES_AT} scope=single-merge request_id=${IN_REQUEST_ID} decision_sha256=${IN_DECISION_SHA256} gate_commit=${GITHUB_SHA} mode=${IN_MODE} run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
             > merge.json
           echo "### merged ${IN_OWNER}/${IN_REPO_NAME}#${IN_PR} at ${IN_SHA}" >> "$GITHUB_STEP_SUMMARY"
           cat merge.json >> "$GITHUB_STEP_SUMMARY"

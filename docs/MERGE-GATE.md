@@ -30,10 +30,12 @@
    - Only comments by a login in `independent_reviewers` count, and never one by the PR's own author. The policy refuses (`policy_invalid`) if that list names the founder account (which agent sessions share today) or the merge App.
    - The shipped list is **empty**, so the gate refuses `independent_reviewer_not_configured` until a distinct reviewer identity exists (ADR-0014 E7/T4).
    - The latest record wins, so a later `FAIL` overrides an earlier `PASS`. The counts must be the integer `0`; booleans, strings, floats or missing keys refuse `independent_review_not_clean`.
-6. **Authorization: a founder signature only.** The founder key, `SHA256:yhaDzjdnB4aFL11XaMxhjHuTYdLwlQXw6L+rS6BILDE`, must sign the exact v2 decision message in namespace `faraday-merge-go`. That key is not on the agent host, so agents cannot produce this signature.
-   - The decision binds the repository, PR, head SHA, **base SHA**, merge method, **policy version** and an **expiry** (ADR-0014 §5 and §6.1). A v1 signature no longer verifies.
+6. **Authorization: a founder signature only.** The founder key, `SHA256:yhaDzjdnB4aFL11XaMxhjHuTYdLwlQXw6L+rS6BILDE`, must sign the exact v3 decision message in namespace `faraday-merge-go`. That key is not on the agent host, so agents cannot produce this signature.
+   - The decision binds the repository, PR, head SHA, **base SHA**, merge method (the ADR's action), **scope** (`single-merge`: this one merge and no other operation), **policy version**, an **expiry** and a single-use **`request_id`** (ADR-0014 §5 and §6.1).
+   - The tag is `faraday-merge-decision:v3`. An earlier `v2` tag named a message without scope and `request_id`, so the tag was bumped rather than reused. v1 and v2 signatures never verify (`founder_signature_invalid`).
+   - `request_id` must be 32 lower-case hex characters (`openssl rand -hex 16`); anything else refuses `invalid_request_id` before any token is minted. The only scope is `single-merge`; a direct caller that changes it refuses `invalid_scope`.
    - The decision is an expiring grant. It refuses `grant_expired` once `expires_at` has passed, and `grant_ttl_exceeds_policy` if it was issued for longer than `grant.max_ttl_hours` (shipped: 24). Both are checked before any token is minted, again at evaluation, and again immediately before the merge.
-   - It is single-use by construction: a merged or closed PR, a moved head, a moved base or a changed policy version all refuse.
+   - It is single-use: the `request_id` is consumed at its first dispatch (see **Single-use request_id** below). A merged or closed PR, a moved head, a moved base or a changed policy version also refuse.
    - **Policy mode is disabled.** It previously accepted a Faraday Review check run (A0/A1), and any workflow's `GITHUB_TOKEN` can create a check run with that name, so the authorization was forgeable.
    - The workflow offers only `mode=founder`. `merge_gate.py` refuses `policy` (`policy_mode_disabled`) and any other mode (`invalid_mode`) at validation, before any token is minted, and again at evaluation.
    - No check run, comment or policy key can stand in for the signature.
@@ -47,16 +49,41 @@ On the founder's own device, which holds the founder key:
 
     # owner/repo in lower case; HEAD_SHA and BASE_SHA are full 40-hex; BASE_SHA is the default-branch tip.
     # POLICY is policy_version from policy/merge-policy.json on main; EXPIRES is UTC, at most 24h ahead.
-    printf 'faraday-merge-decision:v2\nrepo=%s/%s\npr=%s\nhead=%s\nbase=%s\nmethod=%s\npolicy=%s\nexpires=%s\n' \
-        OWNER REPO PR HEAD_SHA BASE_SHA squash POLICY 2026-11-15T18:00:00Z \
+    # REQUEST_ID is fresh for every decision: openssl rand -hex 16
+    printf 'faraday-merge-decision:v3\nrepo=%s/%s\npr=%s\nhead=%s\nbase=%s\nmethod=%s\nscope=single-merge\npolicy=%s\nexpires=%s\nrequest_id=%s\n' \
+        OWNER REPO PR HEAD_SHA BASE_SHA squash POLICY 2026-11-15T18:00:00Z REQUEST_ID \
       | ssh-keygen -Y sign -f ~/.ssh/<founder-key> -n faraday-merge-go | base64 -w0
 
-Dispatch the workflow with `mode=founder`, the same `head_sha`, `base_sha` and `expires_at`, and the output as `founder_signature`. Changing any bound field invalidates the signature. If the default branch moves before the merge, the gate refuses `stale_base`; sign a new decision for the new tip.
+Dispatch the workflow once, with `mode=founder`, the same `head_sha`, `base_sha`, `expires_at` and `request_id`, and the output as `founder_signature`. Changing any bound field invalidates the signature. If the default branch moves before the merge, the gate refuses `stale_base`; sign a new decision for the new tip. A refused dispatch still consumes its `request_id`: to retry, sign a new decision with a new `request_id` (for the same head, only after the earlier decision's `expires_at` has passed, or choose a short expiry).
+
+## Single-use request_id (consumption record)
+ADR-0014 §5 requires the verifier to record a `request_id` as consumed at the first merge attempt, whether it succeeds or not.
+
+**The record is the workflow run itself.** Every dispatch gets the run-name
+`faraday-merge rid=<request_id> target=<owner>/<repo>#<pr>@<head_sha> exp=<expires_at>`. GitHub creates the run, with that name, when the dispatch is accepted and before any job starts, and no API can edit it afterwards. The gate reads the run history with `GITHUB_TOKEN` `actions: read` on this repository only (`merge_gate.py consume`, before any App token, and again inside both `premerge` runs). It refuses:
+- `rerun_refused`: the run is not attempt 1, because a re-run re-uses the inputs and the signature under the same run id;
+- `consumption_record_mismatch`: this run's own name does not parse to exactly this decision (request_id, target, expiry), or the run was created more than `grant.max_ttl_hours` + 1h ago;
+- `request_id_consumed`: an earlier dispatch (lower run id) of this workflow names the same `request_id`, whatever its target and whatever its outcome;
+- `conflicting_decision`: an earlier dispatch names the same repository, PR and head with another `request_id` whose `expires_at` has not passed. So two valid decisions for one PR and head are never both usable;
+- `consumption_record_unreadable`: the run or the listing cannot be read.
+
+The earliest dispatch holds the record, so the outcome is deterministic: a later replay or conflicting dispatch refuses and never blocks the earlier one. The listing covers `2 × grant.max_ttl_hours` + 1h, which holds every dispatch that could still pass the grant window. Run-names that do not parse are ignored, because no decision can use such a run (its own check would refuse).
+
+**Why this record.** It needs no new credential or permission: the merge App keeps its current permissions, and no token gains a write scope. The alternatives were rejected:
+- A PR comment by the merge App needs `issues: write` on every target repository.
+- A check run needs `checks: write` on every target repository, and any check run at the head would also enter the CI evaluation.
+- A repository variable or file needs write tokens that this workflow does not mint.
+
+**Limits.**
+- A user or App with `actions: write` on this repository, such as an org admin, can delete a run. That removes the record, and the `request_id` can then be replayed until its `expires_at`. Deletion appears only in the organization audit log. The 24h expiry bounds the exposure.
+- Anyone who can dispatch this workflow can create a run that names a PR and head. That can block a decision (`conflicting_decision`), but it can never authorize one. A `request_id` is unguessable until it is first used.
+- The record depends on GitHub's run listing including a run created moments earlier. `premerge` re-reads the listing twice more before the merge call.
+- The merge commit repeats the `request_id` (below), which gives a permanent receipt for every successful merge.
 
 ## Tokens
-- **Gate job:** a read-only token for the single target repository.
-- **Merge job:** runs in environment `faraday-merge`. It first mints a contents/pull_requests **read** token (gate repository, ADR repository, target) and runs `merge_gate.py premerge`. Only then does it mint a contents/pull_requests write token for the single target repository, and it runs `premerge` again immediately before `PUT /merge`. `premerge` re-reads, live: the kill switch, the policy version on `main`, the grant expiry, the PR (open, not draft, same head, same-repo head, base still the default branch) and the default-branch tip (still `base_sha`). It merges with `sha=<head>`, so GitHub rejects the merge if the head moved.
-- **Durable audit receipt:** the merge commit message records `faraday-merge-gate:v1 head=... base=... expires=... decision_sha256=... gate_commit=... mode=... run=<url>`. `decision_sha256` is the SHA-256 of the gate's `decision.json`, which is also kept as a 90-day run artifact. The digest stays in git history after the artifact expires.
+- **Gate job:** a read-only token for the single target repository, plus `GITHUB_TOKEN` with `contents: read` and `actions: read` on this repository only, used to read the single-use record.
+- **Merge job:** runs in environment `faraday-merge`. It first mints a contents/pull_requests **read** token (gate repository, ADR repository, target) and runs `merge_gate.py premerge`. Only then does it mint a contents/pull_requests write token for the single target repository, and it runs `premerge` again immediately before `PUT /merge`. `premerge` re-reads, live: the single-use record, the kill switch, the policy version on `main`, the grant expiry, the PR (open, not draft, same head, same-repo head, base still the default branch) and the default-branch tip (still `base_sha`). It merges with `sha=<head>`, so GitHub rejects the merge if the head moved.
+- **Durable audit receipt:** the merge commit message records `faraday-merge-gate:v2 head=... base=... expires=... scope=single-merge request_id=... decision_sha256=... gate_commit=... mode=... run=<url>`. `decision_sha256` is the SHA-256 of the gate's `decision.json`, which is also kept as a 90-day run artifact. The digest stays in git history after the artifact expires.
 
 ## Configuration this workflow needs (separately authorized; not part of this PR)
 - Environment `faraday-merge` in `tomrivera-ops/.github`, with the deployment branch limited to `main`.
@@ -95,4 +122,4 @@ Use any one of these. Each is enough on its own:
 After an emergency disable, also set `activation.enabled` to `false` in a founder-merged PR, and record a `governance-event`.
 
 ## Rollback of a bot merge
-The bot never reverts. The founder reverts interactively: run `git revert -m 1 <merge-sha>` for a merge commit, or `git revert <sha>` for squash or rebase. Open a PR and merge it by hand. The merge commit message (`faraday-merge-gate:v1 head=... run=<url>`) and the 90-day decision artifact identify what to revert.
+The bot never reverts. The founder reverts interactively: run `git revert -m 1 <merge-sha>` for a merge commit, or `git revert <sha>` for squash or rebase. Open a PR and merge it by hand. The merge commit message (`faraday-merge-gate:v2 head=... request_id=... run=<url>`) and the 90-day decision artifact identify what to revert.

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -64,12 +65,16 @@ def iso(ts: float) -> str:
 EXPIRES = iso(time.time() + 3 * 3600)
 
 
+RID = "0123456789abcdef0123456789abcdef"  # a single-use request_id (128-bit, lower-case hex)
+RID2 = "fedcba9876543210fedcba9876543210"
+
+
 def inputs(**kw):
     base = dict(owner="tomrivera-ops", repo="ecosystem-audit", pr="7", sha=SHA, mode="founder", method="squash",
-                base_sha=BASE, expires_at=EXPIRES)
+                base_sha=BASE, expires_at=EXPIRES, request_id=RID)
     base.update(kw)
     return mg.validate_inputs(base["owner"], base["repo"], base["pr"], base["sha"], base["mode"], base["method"],
-                              base["base_sha"], base["expires_at"])
+                              base["base_sha"], base["expires_at"], base["request_id"])
 
 
 def codex_state(sha=SHA, unresolved=False, status="completed", **extra):
@@ -498,7 +503,7 @@ def _isolated_copy():
 
 GATE_ENV = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "IN_OWNER": "tomrivera-ops", "IN_REPO": "ecosystem-audit",
             "IN_PR": "7", "IN_SHA": SHA, "IN_MODE": "founder", "IN_METHOD": "squash",
-            "IN_BASE_SHA": BASE, "IN_EXPIRES_AT": EXPIRES, "IN_ACTIVATION": "true"}
+            "IN_BASE_SHA": BASE, "IN_EXPIRES_AT": EXPIRES, "IN_REQUEST_ID": RID, "IN_ACTIVATION": "true"}
 
 
 class InterpreterIsolation(unittest.TestCase):
@@ -666,7 +671,7 @@ class PolicyModeDisabled(unittest.TestCase):
     def test_founder_allow_records_only_founder_authority(self):
         out = run(forged_authorization_evidence(), inputs())
         self.assertEqual(out["authority"], {"type": "founder_signature", "namespace": mg.SIGNATURE_NAMESPACE,
-                                            "decision_version": "v2"})
+                                            "decision_version": "v3"})
         self.assertEqual(out["mode"], "founder")
 
     def test_unexpected_policy_configuration_cannot_reenable_policy_mode(self):
@@ -1070,7 +1075,7 @@ class Hardening004(unittest.TestCase):
 
     def test_decision_message_binds_every_field(self):
         msg = mg.decision_message(inputs(), POLICY["policy_version"]).decode()
-        for needle in ("faraday-merge-decision:v2\n", "repo=tomrivera-ops/ecosystem-audit\n", "pr=7\n",
+        for needle in ("faraday-merge-decision:v3\n", "repo=tomrivera-ops/ecosystem-audit\n", "pr=7\n",
                        f"head={SHA}\n", f"base={BASE}\n", "method=squash\n",
                        f"policy={POLICY['policy_version']}\n", f"expires={EXPIRES}\n"):
             self.assertIn(needle, msg)
@@ -1116,7 +1121,7 @@ class Hardening004(unittest.TestCase):
 
     def test_entry_point_refuses_expired_grant_before_any_token(self):
         d, marker = _isolated_copy()
-        for cmd in ("validate", "collect", "premerge"):
+        for cmd in ("validate", "consume", "collect", "premerge"):
             env = dict(GATE_ENV, IN_EXPIRES_AT=iso(time.time() - 60), GATE_READ_TOKEN="x",
                        GATE_REPO="tomrivera-ops/.github")
             done = subprocess.run([sys.executable, "-I", "scripts/merge_gate.py", cmd], cwd=d, env=env,
@@ -1169,12 +1174,25 @@ class AdrPin(unittest.TestCase):
         self.assertEqual(cm.exception.code, "governing_adr_pin_mismatch")
 
 
-class PreMerge(unittest.TestCase):
+def run_title(rid=RID, target="tomrivera-ops/ecosystem-audit", pr=7, head=SHA, exp=EXPIRES):
+    """The run-name cli-approve-merge.yml gives every dispatch: the durable single-use record."""
+    return f"faraday-merge rid={rid} target={target}#{pr}@{head} exp={exp}"
+
+
+def wf_run(run_id, title=None, attempt=1, created=None, event="workflow_dispatch", workflow_id=307201282, **kw):
+    return {"id": run_id, "workflow_id": workflow_id, "run_attempt": attempt, "event": event,
+            "display_title": run_title(**kw) if title is None else title,
+            "created_at": created or iso(time.time() - 60)}
+
+
+class _PremergeHarness:
     """The last check before PUT /merge re-reads everything the decision is bound to, live."""
 
-    def fake(self, pr=None, tip=BASE, live_policy=None, adr=ACCEPTED_ADR, wf_state="active", run_wf=307201282):
+    def fake(self, pr=None, tip=BASE, live_policy=None, adr=ACCEPTED_ADR, wf_state="active", run_wf=307201282,
+             own=None, runs=(), runs_error=False):
         pr = pr if pr is not None else copy.deepcopy(evidence()["pr"])
         live_policy = live_policy if live_policy is not None else POLICY
+        own = own if own is not None else wf_run(4242, workflow_id=run_wf)
         calls = []
 
         def fake_api(token, url, method="GET", body=None):
@@ -1192,19 +1210,27 @@ class PreMerge(unittest.TestCase):
             if url.endswith("/repos/tomrivera-ops/ecosystem-audit/git/ref/heads/main"):
                 return {"ref": "refs/heads/main", "object": {"sha": tip}}
             if url.endswith("/repos/tomrivera-ops/.github/actions/runs/4242"):
-                return {"id": 4242, "workflow_id": run_wf}
+                return own
+            if f"/repos/tomrivera-ops/.github/actions/workflows/{run_wf}/runs?" in url:
+                if runs_error:
+                    raise OSError("runs listing unavailable")
+                # Emulate GitHub's created>= filter, so the lookback window itself is under test.
+                since = urllib.parse.unquote(url.split("created=", 1)[1].split("&", 1)[0])
+                self.assertTrue(since.startswith(">="), since)
+                listed = [r for r in (own, *runs) if r["created_at"] >= since[2:]]
+                return {"total_count": len(listed), "workflow_runs": listed}
             if url.endswith(f"/repos/tomrivera-ops/.github/actions/workflows/{run_wf}"):
                 return {"id": run_wf, "state": wf_state}
             raise AssertionError(url)
         return fake_api, calls
 
-    def premerge(self, inp=None, clock=None, digest="0" * 64, policy=None, run_id="4242", **kw):
+    def premerge(self, inp=None, clock=None, digest="0" * 64, policy=None, run_id="4242", run_attempt="1", **kw):
         fake_api, calls = self.fake(**kw)
         orig = mg._api
         mg._api = fake_api
         try:
             return mg.premerge("t", inp or inputs(), policy or POLICY, "tomrivera-ops/.github", "true", digest,
-                               workflow_token="w", run_id=run_id, clock=clock), calls
+                               workflow_token="w", run_id=run_id, run_attempt=run_attempt, clock=clock), calls
         finally:
             mg._api = orig
 
@@ -1212,6 +1238,9 @@ class PreMerge(unittest.TestCase):
         with self.assertRaises(mg.Refuse) as caught:
             self.premerge(**kw)
         self.assertEqual(caught.exception.code, code, caught.exception.detail)
+
+
+class PreMerge(_PremergeHarness, unittest.TestCase):
 
     def test_ok(self):
         out, calls = self.premerge()
@@ -1328,6 +1357,169 @@ class WorkflowStatic004(unittest.TestCase):
         self.assertIn("permission-contents: read", recheck)
         self.assertIn("permission-pull-requests: read", recheck)
         self.assertNotIn(": write", recheck)
+
+
+V2_FORMAT = ("faraday-merge-decision:v2\nrepo={repo}\npr={pr}\nhead={head}\nbase={base}\nmethod={method}\n"
+             "policy={policy}\nexpires={expires}\n")
+
+
+class SingleUse005(_PremergeHarness, unittest.TestCase):
+    """GHO-AUTONOMOUS-PRODUCTION-005 C17b (ADR-0014 section 5, R-3): the decision binds scope and a
+    single-use request_id; a request_id is consumed at its first dispatch; one decision per PR+head."""
+
+    def evaluate_refuses(self, code, inp, sig):
+        with self.assertRaises(mg.Refuse) as caught:
+            run(evidence(), inp, sig)
+        self.assertEqual(caught.exception.code, code, caught.exception.detail)
+
+    # ---- the message: v3 binds scope and request_id; v2 and v1 never verify ----
+    def test_decision_message_v3_binds_scope_and_request_id(self):
+        msg = mg.decision_message(inputs(), POLICY["policy_version"]).decode()
+        self.assertTrue(msg.startswith("faraday-merge-decision:v3\n"), msg)
+        for needle in ("scope=single-merge\n", f"request_id={RID}\n", "repo=tomrivera-ops/ecosystem-audit\n",
+                       "pr=7\n", f"head={SHA}\n", f"base={BASE}\n", "method=squash\n",
+                       f"policy={POLICY['policy_version']}\n", f"expires={EXPIRES}\n"):
+            self.assertIn(needle, msg)
+        self.assertEqual(mg.DECISION_VERSION, "v3")
+
+    def test_v2_signature_without_scope_or_request_id_refuses(self):
+        """R-3: the old v2 message bound neither scope nor request_id; it must no longer authorize."""
+        inp = inputs()
+        v2 = V2_FORMAT.format(repo="tomrivera-ops/ecosystem-audit", pr=7, head=SHA, base=BASE, method="squash",
+                              policy=POLICY["policy_version"], expires=EXPIRES)
+        self.evaluate_refuses("founder_signature_invalid", inp, KEYS.sign(v2.encode()))
+
+    def test_signature_for_another_request_id_or_scope_refuses(self):
+        inp = inputs()
+        self.evaluate_refuses("founder_signature_invalid", inp, good_sig(dict(inp, request_id=RID2)))
+        self.evaluate_refuses("founder_signature_invalid", inp, good_sig(dict(inp, scope="any")))
+
+    def test_scope_cannot_be_widened_by_a_direct_caller(self):
+        inp = dict(inputs(), scope="merge-and-delete-branch")
+        self.evaluate_refuses("invalid_scope", inp, good_sig(inp))
+        inp = inputs()
+        del inp["scope"]
+        with self.assertRaises((mg.Refuse, KeyError)):
+            run(evidence(), inp, "")
+
+    def test_request_id_is_format_validated_before_any_token(self):
+        for bad in ("", "short", RID.upper(), RID + "\n", RID[:31], RID + "0", " " + RID[1:], "g" * 32,
+                    "0123456789abcdef-0123456789abcde", "../" + RID[3:]):
+            with self.assertRaises(mg.Refuse, msg=repr(bad)) as caught:
+                inputs(request_id=bad)
+            self.assertEqual(caught.exception.code, "invalid_request_id")
+
+    def test_allow_records_scope_and_request_id(self):
+        out = run(evidence(), inputs())
+        self.assertEqual(out["request_id"], RID)
+        self.assertEqual(out["scope"], "single-merge")
+        self.assertEqual(out["authority"]["decision_version"], "v3")
+
+    # ---- consumption: the dispatch record is checked before any token and again before PUT /merge ----
+    def test_ok_with_no_other_dispatch(self):
+        out, calls = self.premerge()
+        self.assertEqual(out["premerge"], "ok")
+        self.assertEqual(out["request_id"], RID)
+        self.assertTrue(any("/actions/workflows/307201282/runs?" in u for _, u in calls))
+
+    def test_replay_of_a_consumed_request_id_refuses(self):
+        """RED at 416e6c6: re-dispatching the same signed decision within its TTL was accepted."""
+        self.refuse("request_id_consumed", runs=[wf_run(4100)])
+
+    def test_replay_refuses_even_if_the_earlier_dispatch_failed_or_named_another_target(self):
+        self.refuse("request_id_consumed", runs=[wf_run(4100, target="tomrivera-ops/other", pr=9, head=OLD)])
+        self.refuse("request_id_consumed", runs=[wf_run(4100, exp=iso(time.time() - 3600))])
+
+    def test_conflicting_decision_for_the_same_pr_and_head_refuses(self):
+        """RED at 416e6c6: two valid decisions (different request_ids) for one PR+head were both usable."""
+        self.refuse("conflicting_decision", runs=[wf_run(4100, rid=RID2)])
+        self.refuse("conflicting_decision", runs=[wf_run(4100, rid=RID2, target="TomRivera-Ops/Ecosystem-Audit")])
+        self.refuse("conflicting_decision", runs=[wf_run(4100, rid=RID2, target="tomrivera-ops/tomrivera-ops/ecosystem-audit")])
+
+    def test_lookback_covers_every_run_that_could_still_hold_the_grant(self):
+        ttl = POLICY["grant"]["max_ttl_hours"]
+        for age_h in (1, ttl, 2 * ttl):
+            self.refuse("request_id_consumed", runs=[wf_run(4100, created=iso(time.time() - age_h * 3600))])
+
+    def test_earliest_dispatch_holds_the_record(self):
+        """Deterministic: only the lowest run id may proceed; a later replay never blocks it."""
+        out, _ = self.premerge(runs=[wf_run(4300), wf_run(4301, rid=RID2)])
+        self.assertEqual(out["premerge"], "ok")
+
+    def test_expired_earlier_decision_for_the_same_head_does_not_conflict(self):
+        out, _ = self.premerge(runs=[wf_run(4100, rid=RID2, exp=iso(time.time() - 60))])
+        self.assertEqual(out["premerge"], "ok")
+
+    def test_other_targets_and_unrelated_runs_do_not_conflict(self):
+        runs = [wf_run(4100, rid=RID2, pr=8), wf_run(4101, rid=RID2, head=OLD),
+                wf_run(4102, rid=RID2, target="tomrivera-ops/other"),
+                wf_run(4103, title="CLI Approve & Merge"), wf_run(4104, title="faraday-merge rid=garbage")]
+        out, _ = self.premerge(runs=runs)
+        self.assertEqual(out["premerge"], "ok")
+
+    def test_rerun_of_a_dispatch_refuses(self):
+        """Re-running a run re-uses its inputs (and signature) under the same run id."""
+        self.refuse("rerun_refused", run_attempt="2")
+        self.refuse("rerun_refused", own=wf_run(4242, attempt=2))
+        for bad in ("", "0", "1\n", "x"):
+            self.refuse("rerun_refused", run_attempt=bad)
+
+    def test_own_record_must_name_exactly_this_decision(self):
+        for own in (wf_run(4242, rid=RID2), wf_run(4242, head=OLD), wf_run(4242, pr=8),
+                    wf_run(4242, exp=iso(time.time() + 7200)), wf_run(4242, title="CLI Approve & Merge"),
+                    wf_run(4242, title=run_title()[:-1]), wf_run(4242, event="push"), dict(wf_run(4242), id=99)):
+            self.refuse("consumption_record_mismatch", own=own)
+
+    def test_stale_own_run_refuses(self):
+        ttl = POLICY["grant"]["max_ttl_hours"]
+        self.refuse("consumption_record_mismatch", own=wf_run(4242, created=iso(time.time() - (ttl + 2) * 3600)))
+        self.refuse("consumption_record_mismatch", own=wf_run(4242, created="yesterday"))
+
+    def test_unreadable_record_refuses(self):
+        self.refuse("consumption_record_unreadable", runs_error=True)
+
+    def test_consume_lists_only_this_workflow_and_the_ttl_window(self):
+        _, calls = self.premerge()
+        listing = [u for _, u in calls if "/runs?" in u]
+        self.assertTrue(listing)
+        for url in listing:
+            self.assertIn("event=workflow_dispatch", url)
+            self.assertIn("created=%3E%3D", url)
+
+
+class WorkflowStatic005(unittest.TestCase):
+    wf = WorkflowStatic.wf
+    raw = (ROOT / ".github" / "workflows" / "cli-approve-merge.yml").read_text()
+
+    def test_run_name_is_the_single_use_record(self):
+        self.assertIn("\nrun-name: 'faraday-merge rid=${{ inputs.request_id }} target=${{ inputs.owner }}/${{ inputs.repo }}"
+                      "#${{ inputs.pr_number }}@${{ inputs.head_sha }} exp=${{ inputs.expires_at }}'\n", self.raw)
+
+    def test_request_id_input_reaches_scripts_only_through_env(self):
+        self.assertIn("\n      request_id:\n", self.wf)
+        gate = self.wf.split("\n  gate:\n", 1)[1].split("\n  merge:\n", 1)[0]
+        merge = self.wf.split("\n  merge:\n", 1)[1]
+        for job in (gate, merge):
+            self.assertIn("IN_REQUEST_ID: ${{ inputs.request_id }}", job)
+        on_block = self.wf.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        self.assertLessEqual(len(re.findall(r"^      [a-z_]+:$", on_block, re.M)), 10)
+
+    def test_gate_checks_consumption_before_any_app_token(self):
+        gate = self.wf.split("\n  gate:\n", 1)[1].split("\n  merge:\n", 1)[0]
+        consume = gate.index("python3 -I scripts/merge_gate.py consume")
+        self.assertLess(gate.index("python3 -I scripts/merge_gate.py validate"), consume)
+        self.assertLess(consume, gate.index("actions/create-github-app-token@"))
+        head = gate.split("    steps:", 1)[0]
+        self.assertIn("permissions:\n      contents: read\n      actions: read\n", head)
+        self.assertNotIn(": write", head)
+        self.assertIn("WORKFLOW_STATE_TOKEN: ${{ github.token }}", gate)
+
+    def test_merge_commit_records_request_id_and_scope(self):
+        merge = self.wf.split("\n  merge:\n", 1)[1]
+        msg = merge.split("-f commit_message=", 1)[1].split("\n", 1)[0]
+        self.assertIn("request_id=${IN_REQUEST_ID}", msg)
+        self.assertIn("scope=single-merge", msg)
+        self.assertIn("faraday-merge-gate:v2 ", msg)
 
 
 if __name__ == "__main__":
