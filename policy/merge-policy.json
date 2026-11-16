@@ -1,8 +1,30 @@
 {
-  "policy_version": "2",
+  "policy_version": "3",
   "gate_repository": "tomrivera-ops/.github",
   "gate_paths": [".github/*", "scripts/*", "policy/*", "*.py", "*.pyc", "*.pth", ".gitattributes", ".gitmodules", "CODEOWNERS", "docs/MERGE-GATE.md", "validated.json", "evidence.json", "decision.json"],
   "gate_repository_mergeable_paths": ["*.md", "*.template"],
   "allowed_signers": "policy/founder-allowed-signers",
-  "required_contexts": {}
+  "required_contexts": {
+    "tomrivera-ops/.github": ["required-checks"],
+    "tomrivera-ops/ecosystem-audit": ["required-checks"]
+  },
+  "independent_reviewers": [],
+  "grant": {"max_ttl_hours": 24},
+  "activation": {
+    "enabled": false,
+    "repository_variable": "FARADAY_BOT_MERGE_ENABLED",
+    "governing_adr": {
+      "repository": "tomrivera-ops/agent-contracts",
+      "path": "decisions/ADR-0014-risk-tiered-delegated-merge.md",
+      "required_status": "Accepted",
+      "blob_sha": ""
+    }
+  },
+  "tier": {
+    "path_tiers": "policy/reference-path-tiers.json",
+    "path_tiers_sha256": "5232463d11a9b89fcb217819fc6cba0aa8ff449ac53cd227787e5bfbe5767fc7",
+    "delegated_max_tier": "A1",
+    "repository_floors": {"tomrivera-ops/ecosystem-audit": "A0"},
+    "note": "ADR-0014 (Proposed) reference path tiers, vendored byte-for-byte from faraday-review reference_policy (sanitized: path patterns only). The gate merges only PRs whose tier (highest path tier, raised to the repository floor) is at most delegated_max_tier, and only in listed repositories. Raising either is an A3 policy change."
+  }
 }
