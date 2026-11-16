@@ -461,9 +461,26 @@ class GateRepositoryIntegrity(unittest.TestCase):
         self.refuse_in_gate_repo([{"filename": f} for f in PR12_FILES], {"gate_self_modification"})
 
     def test_documentation_only_pr_to_gate_repository_is_still_allowed(self):
-        ev, inp = gate_repo_case([{"filename": "prompts/repo-audit.md"}, {"filename": "CLAUDE.md.template"},
-                                  {"filename": "ISSUE_TEMPLATE/bug_report.md"}])
-        self.assertEqual(run(ev, inp)["decision"], "ALLOW")
+        """Allowed only when the gate repository is explicitly enrolled (A0 floor) and every path
+        is A0/A1 under the reference tiers; the shipped policy enrolls ecosystem-audit only."""
+        policy = copy.deepcopy(POLICY)
+        policy["tier"]["repository_floors"]["tomrivera-ops/.github"] = "A0"
+        ev, inp = gate_repo_case([{"filename": "prompts/repo-audit.md"}, {"filename": "ISSUE_TEMPLATE/bug_report.md"}])
+        self.assertEqual(run(ev, inp, policy=policy)["decision"], "ALLOW")
+
+    def test_template_in_gate_repository_is_above_the_delegated_tier(self):
+        policy = copy.deepcopy(POLICY)
+        policy["tier"]["repository_floors"]["tomrivera-ops/.github"] = "A0"
+        ev, inp = gate_repo_case([{"filename": "CLAUDE.md.template"}])
+        with self.assertRaises(mg.Refuse) as caught:
+            run(ev, inp, policy=policy)
+        self.assertEqual(caught.exception.code, "tier_not_delegable")
+
+    def test_gate_repository_is_not_enrolled_by_the_shipped_policy(self):
+        ev, inp = gate_repo_case([{"filename": "README.md"}])
+        with self.assertRaises(mg.Refuse) as caught:
+            run(ev, inp)
+        self.assertEqual(caught.exception.code, "repository_not_enrolled")
 
     def test_missing_or_malformed_gate_policy_refuses(self):
         for key, value in (("gate_paths", None), ("gate_paths", "scripts/*"), ("gate_paths", []),
@@ -492,6 +509,7 @@ def _isolated_copy():
     (d / "policy").mkdir()
     shutil.copy2(GATE_FILE, d / "scripts" / "merge_gate.py")
     (d / "policy" / "merge-policy.json").write_text(json.dumps(POLICY))
+    shutil.copy2(ROOT / "policy" / "reference-path-tiers.json", d / "policy" / "reference-path-tiers.json")
     marker = d / "PWNED"
     payload = f"open({str(marker)!r}, 'a').write(__name__ + '\\n')\n"
     for rel in ("scripts/json.py", "scripts/re.py", "scripts/argparse.py", "scripts/subprocess.py",
@@ -1575,6 +1593,132 @@ class WorkflowStatic005(unittest.TestCase):
         self.assertIn("request_id=${IN_REQUEST_ID}", msg)
         self.assertIn("scope=single-merge", msg)
         self.assertIn("faraday-merge-gate:v2 ", msg)
+
+
+class TierGate016(unittest.TestCase):
+    """GHO-PRODUCTION-1-EXECUTION-016: independent path tier (ADR-0014 section 3). The gate merges
+    only enrolled repositories at tier <= delegated_max_tier (never above A1)."""
+
+    def refuse(self, code, files=None, policy=None, **ev_over):
+        ev = evidence(files=files or [{"filename": "docs/readme.md"}], **ev_over)
+        with self.assertRaises(mg.Refuse) as caught:
+            run(ev, inputs(), policy=policy or POLICY)
+        self.assertEqual(caught.exception.code, code, caught.exception.detail)
+        return caught.exception
+
+    def test_vendored_conformance_vectors_all_pass(self):
+        vectors = json.loads((ROOT / "policy" / "reference-tier-vectors.json").read_text())
+        tiers = mg.load_path_tiers(POLICY)
+        for path, want in vectors["paths"]:
+            self.assertEqual(mg.path_tier(path, tiers), want, path)
+        for case in vectors["prs"]:
+            if case["tier"] == "unknown":  # no paths or an unknown floor: the gate refuses instead
+                self.assertTrue(not case["paths"] or case["floor"] not in mg.TIER_FLOORS, case)
+                continue
+            got = max([case["floor"], *(mg.path_tier(p, tiers) for p in case["paths"])], key=mg.TIER_ORDER.index)
+            self.assertEqual(got, case["tier"], case)
+
+    def test_vendored_files_match_their_pins(self):
+        self.assertEqual(hashlib.sha256((ROOT / POLICY["tier"]["path_tiers"]).read_bytes()).hexdigest(),
+                         POLICY["tier"]["path_tiers_sha256"])
+
+    def test_a0_and_a1_paths_are_allowed_and_recorded(self):
+        out = run(evidence(files=[{"filename": "docs/readme.md"}, {"filename": "tests/test_x.py"}]), inputs())
+        self.assertEqual(out["decision"], "ALLOW")
+        self.assertEqual(out["tier"], {"tier": "A1", "floor": "A0", "max": "A1"})
+
+    def test_a2_source_path_refuses_even_with_a_founder_signature(self):
+        self.refuse("tier_not_delegable", [{"filename": "docs/readme.md"}, {"filename": "src/app.py"}])
+
+    def test_a3_governance_paths_refuse(self):
+        for path in (".github/workflows/ci.yml", "policy/x.json", "decisions/ADR-0099.md", "CODEOWNERS",
+                     "schemas/a.schema.json", "nested/.github/dependabot.yml"):
+            self.refuse("tier_not_delegable", [{"filename": path}])
+
+    def test_rename_from_an_a3_path_refuses(self):
+        self.refuse("tier_not_delegable", [{"filename": "docs/moved.md", "previous_filename": ".github/workflows/x.yml"}])
+
+    def test_unlisted_repository_refuses(self):
+        policy = copy.deepcopy(POLICY)
+        policy["tier"]["repository_floors"] = {}
+        self.refuse("repository_not_enrolled", policy=policy)
+
+    def test_a3_floor_repository_refuses_docs(self):
+        policy = copy.deepcopy(POLICY)
+        policy["tier"]["repository_floors"] = {"tomrivera-ops/ecosystem-audit": "A3"}
+        self.refuse("tier_not_delegable", policy=policy)
+
+    def test_floor_match_is_case_insensitive_on_the_canonical_name(self):
+        policy = copy.deepcopy(POLICY)
+        policy["tier"]["repository_floors"] = {"TomRivera-Ops/Ecosystem-Audit": "A0"}
+        self.assertEqual(run(evidence(), inputs(), policy=policy)["decision"], "ALLOW")
+
+    def test_max_tier_cannot_be_raised_above_a1(self):
+        for bad in ("A2", "A3", "A4", None, "a1"):
+            policy = copy.deepcopy(POLICY)
+            policy["tier"]["delegated_max_tier"] = bad
+            self.refuse("policy_invalid", policy=policy)
+
+    def test_a0_only_policy_refuses_a1(self):
+        policy = copy.deepcopy(POLICY)
+        policy["tier"]["delegated_max_tier"] = "A0"
+        self.refuse("tier_not_delegable", [{"filename": "tests/test_x.py"}], policy=policy)
+
+    def test_tampered_or_missing_tier_policy_fails_closed(self):
+        for mutate in (lambda p: p.pop("tier"), lambda p: p["tier"].update(path_tiers_sha256="0" * 64),
+                       lambda p: p["tier"].update(path_tiers="../../etc/passwd"),
+                       lambda p: p["tier"].update(path_tiers="policy/missing.json"),
+                       lambda p: p["tier"].update(repository_floors=[]),
+                       lambda p: p["tier"].update(repository_floors={"tomrivera-ops/ecosystem-audit": "A1"})):
+            policy = copy.deepcopy(POLICY)
+            mutate(policy)
+            self.refuse("policy_invalid", policy=policy)
+
+    def _crafted_root(self, mutate_tiers=None, outside=False):
+        """A temporary gate root holding a (possibly altered) tier file pinned by its own digest."""
+        root = Path(tempfile.mkdtemp())
+        (root / "policy").mkdir()
+        tiers = json.loads((ROOT / "policy" / "reference-path-tiers.json").read_text())
+        if mutate_tiers:
+            mutate_tiers(tiers)
+        raw = json.dumps(tiers).encode()
+        target = (Path(tempfile.mkdtemp()) / "tiers.json") if outside else (root / "policy" / "tiers.json")
+        target.write_bytes(raw)
+        policy = copy.deepcopy(POLICY)
+        policy["tier"]["path_tiers"] = os.path.relpath(target, root)
+        policy["tier"]["path_tiers_sha256"] = hashlib.sha256(raw).hexdigest()
+        return root, policy
+
+    def _with_root(self, root, policy):
+        orig = mg.GATE_ROOT
+        mg.GATE_ROOT = os.path.realpath(root)
+        try:
+            return mg.load_path_tiers(policy)
+        finally:
+            mg.GATE_ROOT = orig
+
+    def test_correctly_pinned_tier_file_outside_the_gate_root_refuses(self):
+        root, policy = self._crafted_root(outside=True)
+        with self.assertRaises(mg.Refuse) as caught:
+            self._with_root(root, policy)
+        self.assertEqual(caught.exception.code, "policy_invalid")
+        root2, policy2 = self._crafted_root()
+        self.assertIn("rules", self._with_root(root2, policy2))  # control: inside the root loads
+
+    def test_tier_file_with_a_delegable_default_refuses(self):
+        for default in ("A0", "A1", "Z9"):
+            root, policy = self._crafted_root(lambda t, d=default: t.update(default=d))
+            with self.assertRaises(mg.Refuse) as caught:
+                self._with_root(root, policy)
+            self.assertEqual(caught.exception.code, "policy_invalid", default)
+
+    def test_tier_is_checked_before_ci_and_codex_evidence(self):
+        """A non-delegable PR refuses on tier even when the other evidence is missing."""
+        self.refuse("tier_not_delegable", [{"filename": "src/app.py"}], check_runs=[])
+
+    def test_shipped_policy_enrolls_only_ecosystem_audit_at_a0_and_max_a1(self):
+        self.assertEqual(SHIPPED_POLICY["tier"]["repository_floors"], {"tomrivera-ops/ecosystem-audit": "A0"})
+        self.assertEqual(SHIPPED_POLICY["tier"]["delegated_max_tier"], "A1")
 
 
 if __name__ == "__main__":

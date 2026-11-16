@@ -725,6 +725,95 @@ def _check_gate_self(ev: dict, inp: dict, paths: list[str], policy: dict) -> Non
         raise Refuse("gate_repository_path_not_allowlisted", others[0])
 
 
+TIER_ORDER = ("A0", "A1", "A2", "A3", "A4")
+TIER_FLOORS = ("A0", "A3")
+DELEGABLE_TIERS = ("A0", "A1")  # ADR-0014 section 4: delegated merge never exceeds A1
+
+
+def _tier_glob(glob: str) -> re.Pattern:
+    """ADR-0014 reference semantics (identical to faraday-review reference_tier):
+    `**/` = zero or more leading directories, `**` = anything, `*` = anything but `/`;
+    case-sensitive and anchored to the whole path."""
+    out, i = "", 0
+    while i < len(glob):
+        if glob.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif glob.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif glob[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        else:
+            out, i = out + re.escape(glob[i]), i + 1
+    return re.compile(out + r"\Z")
+
+
+def load_path_tiers(policy: dict) -> dict:
+    """The vendored reference path tiers, verified against the policy's sha256 pin (fail closed)."""
+    tier = policy.get("tier")
+    if not isinstance(tier, dict):
+        raise Refuse("policy_invalid", "tier")
+    rel, pin = tier.get("path_tiers"), tier.get("path_tiers_sha256")
+    if not isinstance(rel, str) or not rel or not isinstance(pin, str) or not re.fullmatch(r"[0-9a-f]{64}", pin):
+        raise Refuse("policy_invalid", "tier.path_tiers")
+    path = Path(GATE_ROOT, rel).resolve()
+    if not _inside_gate_root(str(path)):
+        raise Refuse("policy_invalid", "tier.path_tiers outside the gate")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise Refuse("policy_invalid", "tier.path_tiers unreadable") from exc
+    if hashlib.sha256(raw).hexdigest() != pin:
+        raise Refuse("policy_invalid", "tier.path_tiers does not match its pin")
+    try:
+        ref = json.loads(raw)
+        rules = {k: [_tier_glob(g) for g in ref[src]] for k, src in
+                 (("a3", "a3_paths"), ("a1", "a1_paths"), ("a0_in", "a0_path_set"),
+                  ("a0_out", "a0_path_exclusions"))}
+        default = ref["default"]
+    except (KeyError, TypeError, ValueError, re.error) as exc:
+        raise Refuse("policy_invalid", "tier.path_tiers malformed") from exc
+    if default not in TIER_ORDER or default in DELEGABLE_TIERS:
+        raise Refuse("policy_invalid", "tier default must be A2 or higher")
+    return {"rules": rules, "default": default}
+
+
+def path_tier(path: str, tiers: dict) -> str:
+    r = tiers["rules"]
+    if any(p.match(path) for p in r["a3"]):
+        return "A3"
+    if any(p.match(path) for p in r["a0_in"]) and not any(p.match(path) for p in r["a0_out"]):
+        return "A0"
+    if any(p.match(path) for p in r["a1"]):
+        return "A1"
+    return tiers["default"]
+
+
+def _check_tier(ev: dict, inp: dict, paths: list[str], policy: dict) -> dict:
+    """Independent path tier (ADR-0014 section 3): the highest path tier, raised to the repository
+    floor. The gate refuses any PR above delegated_max_tier (never above A1) and any repository
+    not listed in repository_floors. A founder signature never widens this."""
+    tiers = load_path_tiers(policy)
+    tier_policy = policy["tier"]
+    max_tier = tier_policy.get("delegated_max_tier")
+    if max_tier not in DELEGABLE_TIERS:
+        raise Refuse("policy_invalid", "tier.delegated_max_tier must be A0 or A1")
+    floors = tier_policy.get("repository_floors")
+    if not isinstance(floors, dict):
+        raise Refuse("policy_invalid", "tier.repository_floors")
+    repo = _canonical_repo(ev, inp)
+    floor = {k.lower(): v for k, v in floors.items() if isinstance(k, str)}.get(repo)
+    if floor is None:
+        raise Refuse("repository_not_enrolled", repo)
+    if floor not in TIER_FLOORS:
+        raise Refuse("policy_invalid", f"tier.repository_floors[{repo}]")
+    per_path = {p: path_tier(p, tiers) for p in paths}
+    tier = max([floor, *per_path.values()], key=TIER_ORDER.index)
+    if TIER_ORDER.index(tier) > TIER_ORDER.index(max_tier):
+        worst = next(p for p in paths if per_path[p] == tier) if tier != floor or not paths else "(repository floor)"
+        raise Refuse("tier_not_delegable", f"{tier} > {max_tier}: {worst}")
+    return {"tier": tier, "floor": floor, "max": max_tier}
+
+
 def _check_ci(ev: dict, inp: dict, policy: dict) -> None:
     runs = ev["check_runs"]
     if not runs:
@@ -895,6 +984,7 @@ def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
     _check_pr(ev, inp)
     paths = _changed_paths(ev)
     _check_gate_self(ev, inp, paths, policy)
+    tier = _check_tier(ev, inp, paths, policy)
     _check_base(ev, inp)
     _check_ci(ev, inp, policy)
     _check_codex(ev, inp)
@@ -906,6 +996,7 @@ def evaluate(ev: dict, inp: dict, policy: dict, *, signature_b64: str = "",
     return {"gate_version": GATE_VERSION, "decision": "ALLOW", **bound, "policy_version": version,
             "policy_sha256": policy_digest(policy),
             "files": len(paths),
+            "tier": tier,
             "independent_review": {k: independent.get(k) for k in ("reviewer", "verdict")},
             "authority": authority}
 

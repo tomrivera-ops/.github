@@ -1,0 +1,216 @@
+{
+  "format": "adr-0014-reference-tier-vectors/v1",
+  "status": "proposed",
+  "paths": [
+    [
+      "README.md",
+      "A0"
+    ],
+    [
+      "docs/guide.md",
+      "A0"
+    ],
+    [
+      "tests/README.md",
+      "A0"
+    ],
+    [
+      "tests/test_x.py",
+      "A1"
+    ],
+    [
+      "pkg/tests/data.json",
+      "A1"
+    ],
+    [
+      "src/a_test.go",
+      "A1"
+    ],
+    [
+      "web/x.test.ts",
+      "A1"
+    ],
+    [
+      "web/x.spec.js",
+      "A1"
+    ],
+    [
+      "tests/fixtures/a.yml",
+      "A1"
+    ],
+    [
+      "src/__tests__/a.js",
+      "A1"
+    ],
+    [
+      "src/app.py",
+      "A2"
+    ],
+    [
+      "package.json",
+      "A2"
+    ],
+    [
+      "requirements.txt",
+      "A2"
+    ],
+    [
+      "docs/build.py",
+      "A2"
+    ],
+    [
+      "Makefile",
+      "A2"
+    ],
+    [
+      "config/settings.yaml",
+      "A2"
+    ],
+    [
+      ".github/workflows/ci.yml",
+      "A3"
+    ],
+    [
+      ".github/PULL_REQUEST_TEMPLATE.md",
+      "A3"
+    ],
+    [
+      "decisions/ADR-0001-x.md",
+      "A3"
+    ],
+    [
+      "docs/ADR-0009-y.md",
+      "A3"
+    ],
+    [
+      "schemas/a.schema.json",
+      "A3"
+    ],
+    [
+      "schemas/validate.md",
+      "A3"
+    ],
+    [
+      "pkg/schemas/notes.rst",
+      "A3"
+    ],
+    [
+      "policy/merge-policy.json",
+      "A3"
+    ],
+    [
+      "governance/x.md",
+      "A3"
+    ],
+    [
+      "review-policy/README.md",
+      "A3"
+    ],
+    [
+      "CODEOWNERS",
+      "A3"
+    ],
+    [
+      "docs/CODEOWNERS",
+      "A3"
+    ],
+    [
+      "src/auth/login.py",
+      "A3"
+    ],
+    [
+      "src/auth.py",
+      "A3"
+    ],
+    [
+      "lib/auth_flow.js",
+      "A3"
+    ],
+    [
+      "svc/user_auth.go",
+      "A3"
+    ],
+    [
+      "src/oauth_client.py",
+      "A3"
+    ],
+    [
+      "tests/test_credentials.py",
+      "A3"
+    ],
+    [
+      "tests/fixtures/secrets.json",
+      "A3"
+    ],
+    [
+      "src/faraday_review/governance/x.py",
+      "A3"
+    ],
+    [
+      "src/request_validator.py",
+      "A3"
+    ],
+    [
+      "Dockerfile",
+      "A3"
+    ],
+    [
+      "infra/main.tf",
+      "A3"
+    ],
+    [
+      "deploy/run.sh",
+      "A3"
+    ],
+    [
+      "svc/k8s/pod.yaml",
+      "A3"
+    ]
+  ],
+  "prs": [
+    {
+      "paths": [
+        "README.md",
+        "docs/a.md"
+      ],
+      "floor": "A0",
+      "tier": "A0"
+    },
+    {
+      "paths": [
+        "README.md",
+        "tests/test_x.py"
+      ],
+      "floor": "A0",
+      "tier": "A1"
+    },
+    {
+      "paths": [
+        "tests/test_x.py",
+        "src/app.py"
+      ],
+      "floor": "A0",
+      "tier": "A2"
+    },
+    {
+      "paths": [
+        "src/app.py",
+        ".github/workflows/ci.yml"
+      ],
+      "floor": "A0",
+      "tier": "A3"
+    },
+    {
+      "paths": [
+        "README.md"
+      ],
+      "floor": "A3",
+      "tier": "A3"
+    },
+    {
+      "paths": [],
+      "floor": "A0",
+      "tier": "unknown"
+    }
+  ]
+}

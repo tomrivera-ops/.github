@@ -19,5 +19,12 @@
       "required_status": "Accepted",
       "blob_sha": ""
     }
+  },
+  "tier": {
+    "path_tiers": "policy/reference-path-tiers.json",
+    "path_tiers_sha256": "5232463d11a9b89fcb217819fc6cba0aa8ff449ac53cd227787e5bfbe5767fc7",
+    "delegated_max_tier": "A1",
+    "repository_floors": {"tomrivera-ops/ecosystem-audit": "A0"},
+    "note": "ADR-0014 (Proposed) reference path tiers, vendored byte-for-byte from faraday-review reference_policy (sanitized: path patterns only). The gate merges only PRs whose tier (highest path tier, raised to the repository floor) is at most delegated_max_tier, and only in listed repositories. Raising either is an A3 policy change."
   }
 }
