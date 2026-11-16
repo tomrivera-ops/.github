@@ -1189,7 +1189,7 @@ class _PremergeHarness:
     """The last check before PUT /merge re-reads everything the decision is bound to, live."""
 
     def fake(self, pr=None, tip=BASE, live_policy=None, adr=ACCEPTED_ADR, wf_state="active", run_wf=307201282,
-             own=None, runs=(), runs_error=False, total_delta=0, pages=None):
+             own=None, runs=(), runs_error=False, total_delta=0, pages=None, shift_after_page1=None):
         pr = pr if pr is not None else copy.deepcopy(evidence()["pr"])
         live_policy = live_policy if live_policy is not None else POLICY
         own = own if own is not None else wf_run(4242, workflow_id=run_wf)
@@ -1219,9 +1219,16 @@ class _PremergeHarness:
                 if "created=" in url:
                     since = urllib.parse.unquote(url.split("created=", 1)[1].split("&", 1)[0])
                     listed = [r for r in listed if r["created_at"] >= since.lstrip("<>=")]
-                if pages is not None:  # paginated emulation: 100 per page
+                if pages is not None:  # paginated emulation: 100 per page, newest first
                     page = int(url.split("&page=", 1)[1].split("&", 1)[0])
                     listed = (listed + list(pages))
+                    if shift_after_page1 is not None and page > 1:
+                        # A new dispatch lands between page requests (newest first): pages shift.
+                        listed = [shift_after_page1, *listed]
+                        if shift_after_page1.get("_same_total"):
+                            listed = listed[:-1] + [listed[-1]]
+                            return {"total_count": len(listed) - 1,
+                                    "workflow_runs": listed[(page - 1) * 100:page * 100]}
                     return {"total_count": len(listed) + total_delta,
                             "workflow_runs": listed[(page - 1) * 100:page * 100]}
                 return {"total_count": len(listed) + total_delta, "workflow_runs": listed}
@@ -1509,6 +1516,18 @@ class SingleUse005(_PremergeHarness, unittest.TestCase):
         """Older dispatches beyond the first page (and beyond 1,000 filtered results) still count."""
         filler = [wf_run(5000 + i, event="push", title="push run") for i in range(150)]
         self.refuse("request_id_consumed", runs=filler, pages=[wf_run(4100)])
+
+    def test_run_created_during_pagination_refuses(self):
+        """Codex P2 (3473638): a dispatch created between page requests shifts page 2; the oldest
+        run (holding the consumed request_id) would be skipped. The changed total refuses."""
+        filler = [wf_run(5000 + i, event="push", title="push run") for i in range(198)]
+        self.refuse("consumption_record_unreadable", runs=filler, pages=[wf_run(4100)],
+                    shift_after_page1=wf_run(9999, event="push", title="new push"))
+
+    def test_duplicate_ids_across_pages_refuse_even_with_a_stable_total(self):
+        filler = [wf_run(5000 + i, event="push", title="push run") for i in range(198)]
+        shifted = dict(wf_run(9999, event="push", title="new push"), _same_total=True)
+        self.refuse("consumption_record_unreadable", runs=filler, pages=[wf_run(4100)], shift_after_page1=shifted)
 
     def test_non_dispatch_runs_never_hold_a_record(self):
         out, _ = self.premerge(runs=[wf_run(4100, event="push"), wf_run(4101, rid=RID2, event="schedule")])

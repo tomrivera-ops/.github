@@ -560,17 +560,25 @@ def _paged_complete(token: str, url: str, key: str, cap: int) -> list:
         data = _api(token, f"{url}{sep}per_page=100&page={page}")
         if not isinstance(data, dict) or not isinstance(data.get(key), list):
             raise Refuse("consumption_record_unreadable", "listing shape")
+        page_total = data.get("total_count")
+        if type(page_total) is not int or page_total < 0:
+            raise Refuse("consumption_record_unreadable", "listing total_count")
         if total is None:
-            total = data.get("total_count")
-            if type(total) is not int or total < 0:
-                raise Refuse("consumption_record_unreadable", "listing total_count")
+            total = page_total
             if total > cap:
                 raise Refuse("evidence_too_large", f"{total} runs exceed {cap}")
+        elif page_total != total:
+            # A run created (or deleted) between page requests shifts later pages, so a record
+            # can be skipped; the listing is refused rather than trusted (Codex P2, 3473638).
+            raise Refuse("consumption_record_unreadable", "listing changed during pagination")
         items = data[key]
         out.extend(items)
         if len(out) >= total or len(items) < 100:
             break
         page += 1
+    ids = [i.get("id") if isinstance(i, dict) else None for i in out]
+    if len(set(ids)) != len(ids):
+        raise Refuse("consumption_record_unreadable", "listing changed during pagination")
     if len(out) < total:
         raise Refuse("consumption_record_unreadable", f"listing incomplete: {len(out)} of {total}")
     return out
