@@ -456,9 +456,12 @@ def check_single_use(token: str, gate_repo: str, run_id: str, run_attempt: str, 
         raise Refuse("consumption_record_mismatch", "this run's record does not name this decision")
     if created is None or not now - (ttl + 1) * 3600 <= created <= now + 300:
         raise Refuse("consumption_record_mismatch", "run created outside the grant window")
-    url = f"https://api.github.com/repos/{gate_repo}/actions/workflows/{own['workflow_id']}/runs?event=workflow_dispatch"
+    # No `event` filter: GitHub caps filtered run listings at 1,000 results, which would silently
+    # hide older consumption records (Codex P2, 8477415). The unfiltered listing is checked for
+    # completeness against total_count and refused explicitly beyond MAX_RUN_HISTORY.
+    url = f"https://api.github.com/repos/{gate_repo}/actions/workflows/{own['workflow_id']}/runs"
     try:
-        runs = _paged(token, url, key="workflow_runs")
+        runs = _paged_complete(token, url, "workflow_runs", MAX_RUN_HISTORY)
     except Refuse:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -468,6 +471,8 @@ def check_single_use(token: str, gate_repo: str, run_id: str, run_attempt: str, 
         rid = r.get("id") if isinstance(r, dict) else None
         if type(rid) is not int:
             raise Refuse("consumption_record_unreadable", "run without id")
+        if r.get("event") != "workflow_dispatch":
+            continue  # only a dispatch can carry (and consume) a decision
         if rid >= me:
             continue  # the earliest dispatch holds the record; a later one never blocks it
         other = _run_record(r.get("display_title"))
@@ -538,6 +543,37 @@ def _api(token: str, url: str, method: str = "GET", body: dict | None = None) ->
         "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "faraday-merge-gate"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read() or b"null")
+
+
+# Whole-history ceiling for the single-use consumption listing (unfiltered workflow runs).
+MAX_RUN_HISTORY = 5000
+
+
+def _paged_complete(token: str, url: str, key: str, cap: int) -> list:
+    """Every item of an object-wrapped listing, proven complete against its total_count.
+    Refuses when total_count is missing, exceeds `cap`, or the pages collected fall short of it."""
+    out: list = []
+    total = None
+    page = 1
+    while True:
+        sep = "&" if "?" in url else "?"
+        data = _api(token, f"{url}{sep}per_page=100&page={page}")
+        if not isinstance(data, dict) or not isinstance(data.get(key), list):
+            raise Refuse("consumption_record_unreadable", "listing shape")
+        if total is None:
+            total = data.get("total_count")
+            if type(total) is not int or total < 0:
+                raise Refuse("consumption_record_unreadable", "listing total_count")
+            if total > cap:
+                raise Refuse("evidence_too_large", f"{total} runs exceed {cap}")
+        items = data[key]
+        out.extend(items)
+        if len(out) >= total or len(items) < 100:
+            break
+        page += 1
+    if len(out) < total:
+        raise Refuse("consumption_record_unreadable", f"listing incomplete: {len(out)} of {total}")
+    return out
 
 
 def _paged(token: str, url: str, key: str | None = None, cap: int = 2000) -> list:

@@ -1189,7 +1189,7 @@ class _PremergeHarness:
     """The last check before PUT /merge re-reads everything the decision is bound to, live."""
 
     def fake(self, pr=None, tip=BASE, live_policy=None, adr=ACCEPTED_ADR, wf_state="active", run_wf=307201282,
-             own=None, runs=(), runs_error=False):
+             own=None, runs=(), runs_error=False, total_delta=0, pages=None):
         pr = pr if pr is not None else copy.deepcopy(evidence()["pr"])
         live_policy = live_policy if live_policy is not None else POLICY
         own = own if own is not None else wf_run(4242, workflow_id=run_wf)
@@ -1219,7 +1219,12 @@ class _PremergeHarness:
                 if "created=" in url:
                     since = urllib.parse.unquote(url.split("created=", 1)[1].split("&", 1)[0])
                     listed = [r for r in listed if r["created_at"] >= since.lstrip("<>=")]
-                return {"total_count": len(listed), "workflow_runs": listed}
+                if pages is not None:  # paginated emulation: 100 per page
+                    page = int(url.split("&page=", 1)[1].split("&", 1)[0])
+                    listed = (listed + list(pages))
+                    return {"total_count": len(listed) + total_delta,
+                            "workflow_runs": listed[(page - 1) * 100:page * 100]}
+                return {"total_count": len(listed) + total_delta, "workflow_runs": listed}
             if url.endswith(f"/repos/tomrivera-ops/.github/actions/workflows/{run_wf}"):
                 return {"id": run_wf, "state": wf_state}
             raise AssertionError(url)
@@ -1490,16 +1495,32 @@ class SingleUse005(_PremergeHarness, unittest.TestCase):
         listing = [u for _, u in calls if "/runs?" in u]
         self.assertTrue(listing)
         for url in listing:
-            self.assertIn("event=workflow_dispatch", url)
+            # Codex P2 (8477415): an `event` filter caps the listing at 1,000 results.
+            self.assertNotIn("event=", url)
             self.assertNotIn("created=", url)  # the whole history: consumption never ages out
 
+    def test_listing_shorter_than_total_count_refuses(self):
+        self.refuse("consumption_record_unreadable", total_delta=1)
+
+    def test_history_beyond_max_run_history_refuses_explicitly(self):
+        self.refuse("evidence_too_large", total_delta=mg.MAX_RUN_HISTORY)
+
+    def test_consumed_record_on_a_later_page_refuses(self):
+        """Older dispatches beyond the first page (and beyond 1,000 filtered results) still count."""
+        filler = [wf_run(5000 + i, event="push", title="push run") for i in range(150)]
+        self.refuse("request_id_consumed", runs=filler, pages=[wf_run(4100)])
+
+    def test_non_dispatch_runs_never_hold_a_record(self):
+        out, _ = self.premerge(runs=[wf_run(4100, event="push"), wf_run(4101, rid=RID2, event="schedule")])
+        self.assertEqual(out["premerge"], "ok")
+
     def test_history_beyond_the_pagination_cap_refuses(self):
-        orig = mg._paged
-        mg._paged = lambda *a, **k: (_ for _ in ()).throw(mg.Refuse("evidence_too_large", "runs"))
+        orig = mg._paged_complete
+        mg._paged_complete = lambda *a, **k: (_ for _ in ()).throw(mg.Refuse("evidence_too_large", "runs"))
         try:
             self.refuse("evidence_too_large")
         finally:
-            mg._paged = orig
+            mg._paged_complete = orig
 
 
 class WorkflowStatic005(unittest.TestCase):
